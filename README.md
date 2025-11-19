@@ -2,6 +2,8 @@
 
 `bpub` is a method for embedding data on Bitcoin using fake pubkeys that *appear* to be real compressed secp256k1 pubkeys.
 
+Note: there is currently a bug that requires you share `redeem_scripts.json` to allow for reconstruction. I am working on a more self-contained version that will not require this.
+
 Usage:
 ```
 # Encode file
