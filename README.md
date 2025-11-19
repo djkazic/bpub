@@ -69,4 +69,7 @@ $ python3 bpub.py signreveal reveal.psbt \
 
 # recover from tx hex to file
 $ python3 bpub.py txrecover reveal.hex > monkey.jpg
+
+# run indexer (scans for embedded data on-chain)
+$ python3 indexer.py
 ```
