@@ -320,12 +320,20 @@ def estimate_fee(n_inputs: int, n_outputs: int, feerate: int) -> int:
     - Base tx: ~10 bytes version+locktime, ~41 bytes overhead
     - Input: P2WPKH ~68 vbytes, P2WSH multisig ~ ~100+ vbytes
       We'll just approximate with 100 vbytes per input.
-    - Output: 31-34 vbytes
+    - Output: 34 vbytes
 
     This is deliberately conservative; use `testmempoolaccept` for exact numbers.
     """
     base_vbytes = 100
     in_vbytes = n_inputs * 100
+    out_vbytes = n_outputs * 34
+    vbytes = base_vbytes + in_vbytes + out_vbytes
+    return vbytes * feerate
+
+
+def estimate_fee_reveal(n_inputs: int, n_outputs: int, feerate: int) -> int:
+    base_vbytes = 100
+    in_vbytes = n_inputs * 188
     out_vbytes = n_outputs * 34
     vbytes = base_vbytes + in_vbytes + out_vbytes
     return vbytes * feerate
@@ -655,7 +663,7 @@ def cmd_revealpsbt(args):
         sys.exit("Not enough BPUB UTXOs provided for all data chunks")
 
     # Estimate fee: n_inputs = len(utxos), n_outputs = 1
-    fee = estimate_fee(n_inputs=len(utxos), n_outputs=1, feerate=args.feerate)
+    fee = estimate_fee_reveal(n_inputs=len(utxos), n_outputs=1, feerate=args.feerate)
     if total_in <= fee:
         sys.exit(f"Total BPUB UTXO value ({total_in}) <= fee ({fee})")
 

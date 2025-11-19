@@ -126,6 +126,11 @@
           img.src = 'media/' + item.stored_filename;
           img.alt = item.filename || item.txid;
 
+          const link = document.createElement('a');
+          link.href = 'media/' + item.stored_filename;
+          link.target = '_blank';
+          link.appendChild(img);
+
           const meta = document.createElement('div');
           meta.className = 'meta';
 
@@ -148,7 +153,7 @@
           meta.appendChild(info);
           meta.appendChild(tx);
 
-          card.appendChild(img);
+          card.appendChild(link);
           card.appendChild(meta);
           grid.appendChild(card);
         });
