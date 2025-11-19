@@ -160,7 +160,14 @@ class UTXO:
 
 
 def estimate_fee(for_outputs, feerate):
-    return (68 + (for_outputs * 34) + 10) * feerate
+    BASE_TX_WEIGHT = 151 * 4
+    INPUT_WEIGHT = 68 * 4
+    OUTPUT_WEIGHT = 34 * 4
+
+    weight = BASE_TX_WEIGHT + INPUT_WEIGHT + for_outputs * OUTPUT_WEIGHT
+    vbytes = (weight + 3) // 4
+
+    return vbytes * feerate
 
 
 def main():
@@ -294,7 +301,6 @@ def main():
             indent=2,
         )
         print(tx.serialize().hex())
-        print(f"# Fee {fee}  Change {change}")
         return
 
     # ---------- txpsbt ----------
