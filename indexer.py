@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-BPUB indexer: scan the Bitcoin blockchain for BPUB v3.5 reveal transactions
-and build a simple on-disk "gallery":
+BPUB indexer: scan the Bitcoin blockchain for BPUB reveal transactions
+(v3.5 legacy and v4 stealth) and build a simple on-disk "gallery":
 
     GALLERY_DIR/
       manifest.json
@@ -13,6 +13,11 @@ and build a simple on-disk "gallery":
 - Runs forever, polling for new blocks.
 - Auto-detects BPUB-style 1-of-N multisig P2WSH spends and reconstructs
   the embedded BPUB stream via bpub.decode_*().
+
+This works with:
+
+- BPUB v3.5 streams (with "BPUB" magic + TLV header).
+- BPUB v4 stealth streams (headerless, raw DEFLATE + XOR).
 """
 
 import os
@@ -143,6 +148,13 @@ def guess_extension(mime: Optional[str], existing_name: str) -> str:
 
 
 def try_extract_bpub_from_tx(rawtx_hex: str):
+    """
+    Try to detect and extract a BPUB stream (v3.5 or v4) from a transaction.
+
+    Returns:
+      (meta, content) on success, or None if no BPUB-like multisig is found
+      or decoding fails.
+    """
     try:
         tx = CTransaction.deserialize(bytes.fromhex(rawtx_hex))
     except Exception:
@@ -196,10 +208,10 @@ def try_extract_bpub_from_tx(rawtx_hex: str):
             continue
 
         total_keys = len(pubkeys)
-        if op_n != 0x50 + total_keys and op_n != total_keys:
+        if total_keys < 2:
             continue
 
-        if total_keys < 2:
+        if op_n != 0x50 + total_keys and op_n != total_keys:
             continue
 
         control_pk_here = pubkeys[-1]
@@ -220,6 +232,9 @@ def try_extract_bpub_from_tx(rawtx_hex: str):
         meta, content = decode_stream(raw_stream)
     except Exception:
         return None
+
+    if "bpub_version" not in meta:
+        meta["bpub_version"] = "unknown"
 
     return meta, content
 
@@ -307,6 +322,7 @@ def main():
                 filename_meta = meta.get("filename") or txid
                 mime = meta.get("mime")
                 size = meta.get("size")
+                bpub_version = meta.get("bpub_version")
 
                 base_name = safe_filename(filename_meta)
                 stored_name = guess_extension(mime, base_name)
@@ -332,11 +348,12 @@ def main():
                     "stored_filename": stored_name,
                     "mime": mime,
                     "size": size,
+                    "bpub_version": bpub_version,
                 }
                 manifest.append(entry)
                 known_txids.add(txid)
                 sys.stderr.write(
-                    f"[FOUND] BPUB file in tx {txid}: "
+                    f"[FOUND] BPUB v{bpub_version} file in tx {txid}: "
                     f"{stored_name} ({size} bytes, mime={mime})\n"
                 )
 
