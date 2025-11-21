@@ -1153,6 +1153,7 @@ def cmd_signreveal(args):
         sys.exit(1)
 
     pub = priv.pub
+    pub_bytes = bytes(pub)
     pub_hex = pub.hex()
 
     if args.control_pubkey:
@@ -1160,9 +1161,6 @@ def cmd_signreveal(args):
         if control_hex != pub_hex.lower():
             sys.stderr.write("WIF/pubkey mismatch!\n")
             sys.exit(1)
-
-    ks = KeyStore()
-    ks.add_key(priv)
 
     is_owner_psbt = False
     for idx, inp in enumerate(psbt.inputs):
@@ -1176,8 +1174,11 @@ def cmd_signreveal(args):
         except ValueError:
             continue
 
-    if not is_owner_psbt:
-        unsigned_tx = psbt.unsigned_tx
+    unsigned_tx = psbt.unsigned_tx
+
+    if is_owner_psbt:
+        ks = KeyStore()
+        ks.add_key(priv)
 
         for idx, inp in enumerate(psbt.inputs):
             try:
@@ -1185,89 +1186,129 @@ def cmd_signreveal(args):
             except Exception:
                 pass
 
-        try:
-            final_tx = psbt.extract_transaction()
-        except Exception as e:
-            sys.stderr.write(f"extract_transaction failed: {e}\n")
-            sys.exit(1)
+        def hash160(pubkey_bytes: bytes) -> bytes:
+            return hashlib.new("ripemd160", hashlib.sha256(pubkey_bytes).digest()).digest()
 
-        raw_hex = final_tx.serialize().hex()
-        sys.stdout.write(raw_hex + "\n")
-        return
+        for idx, inp in enumerate(psbt.inputs):
+            wit_script = getattr(inp, "witness_script", None)
+            if not wit_script:
+                sys.stderr.write(
+                    f"  - Input {idx}: NO witness_script -> likely standard.\n"
+                )
+                continue
 
-    unsigned_tx = psbt.unsigned_tx
+            wit_script_bytes = bytes(wit_script)
 
-    for idx, inp in enumerate(psbt.inputs):
-        try:
-            inp.sign(unsigned_tx, ks, finalize=False)
-        except Exception:
-            pass
+            try:
+                bpub_id, owner_h160 = decode_owner_redeem_script(wit_script_bytes)
+            except ValueError:
+                continue
 
-    def hash160(pubkey_bytes: bytes) -> bytes:
-        return hashlib.new("ripemd160", hashlib.sha256(pubkey_bytes).digest()).digest()
+            if hash160(pub_bytes) != owner_h160:
+                continue
 
-    pubkey_bytes = bytes(pub)
+            wutxo = getattr(inp, "witness_utxo", None)
+            if wutxo is None:
+                sys.stderr.write(f"Input {idx}: no witness_utxo -> cannot sign owner.\n")
+                continue
 
-    for idx, inp in enumerate(psbt.inputs):
-        wit_script = getattr(inp, "witness_script", None)
-        if not wit_script:
-            sys.stderr.write(
-                f"  - Input {idx}: NO witness_script -> likely standard.\n"
-            )
-            continue
+            amount = wutxo.nValue
 
-        wit_script_bytes = bytes(wit_script)
+            try:
+                sighash = SignatureHash(
+                    wit_script,
+                    unsigned_tx,
+                    idx,
+                    SIGHASH_ALL,
+                    amount,
+                    SIGVERSION_WITNESS_V0,
+                )
+            except Exception as e:
+                sys.stderr.write(f"Input {idx}: failed computing sighash: {e}\n")
+                continue
 
-        try:
-            bpub_id, owner_h160 = decode_owner_redeem_script(wit_script_bytes)
-        except ValueError:
-            continue
+            try:
+                sig = priv.sign(sighash) + bytes([SIGHASH_ALL])
+            except Exception as e:
+                sys.stderr.write(f"Input {idx}: signing failed: {e}\n")
+                continue
 
-        if hash160(pubkey_bytes) != owner_h160:
-            continue
+            try:
+                w = CScriptWitness([sig, pub_bytes, wit_script_bytes])
+                inp.final_script_witness = w
+            except Exception as e:
+                sys.stderr.write(f"Input {idx}: failed to set final witness: {e}\n")
+                continue
 
-        wutxo = getattr(inp, "witness_utxo", None)
-        if wutxo is None:
-            sys.stderr.write(f"Input {idx}: no witness_utxo -> cannot sign owner.\n")
-            continue
+    else:
+        for idx, inp in enumerate(psbt.inputs):
+            wutxo = getattr(inp, "witness_utxo", None)
+            wit_script = getattr(inp, "witness_script", None)
 
-        amount = wutxo.nValue
+            if wutxo is None or not wit_script:
+                sys.stderr.write(
+                    f"Input {idx}: missing witness_utxo or witness_script; skipping.\n"
+                )
+                continue
 
-        try:
-            sighash = SignatureHash(
-                wit_script,
-                unsigned_tx,
-                idx,
-                SIGHASH_ALL,
-                amount,
-                SIGVERSION_WITNESS_V0,
-            )
-        except Exception as e:
-            sys.stderr.write(f"Input {idx}: failed computing sighash: {e}\n")
-            continue
+            rs = wit_script
+            rs_bytes = bytes(rs)
 
-        try:
-            sig = priv.sign(sighash) + bytes([SIGHASH_ALL])
-        except Exception as e:
-            sys.stderr.write(f"Input {idx}: signing failed: {e}\n")
-            continue
+            try:
+                elems = list(CScript(rs_bytes))
+            except Exception:
+                sys.stderr.write(f"Input {idx}: redeemScript parse failed; skipping.\n")
+                continue
 
-        try:
-            w = CScriptWitness([sig, pubkey_bytes, wit_script_bytes])
-            inp.final_script_witness = w
-        except Exception as e:
-            sys.stderr.write(f"Input {idx}: failed to set final witness: {e}\n")
-            continue
+            if len(elems) < 4:
+                continue
 
-    for idx, inp in enumerate(psbt.inputs):
-        has_wit = getattr(inp, "final_script_witness", None)
-        has_wit_stack = bool(getattr(has_wit, "stack", [])) if has_wit else False
-        if has_wit_stack or getattr(inp, "final_script_sig", b""):
-            continue
-        try:
-            inp.finalize(unsigned_tx)
-        except Exception:
-            pass
+            op_1 = elems[0]
+            op_n = elems[-2]
+            op_check = elems[-1]
+
+            is_op_1 = isinstance(op_1, int) and (op_1 == 0x51 or op_1 == 1)
+            is_op_checkmultisig = isinstance(op_check, int) and (op_check in (0xAE, 174))
+
+            if not (is_op_1 and is_op_checkmultisig and isinstance(op_n, int)):
+                continue
+
+            middle = elems[1:-2]
+            pubkeys = [e for e in middle if isinstance(e, (bytes, bytearray))]
+            if not pubkeys or len(pubkeys) != len(middle):
+                continue
+
+            control_pk_here = pubkeys[-1]
+            if control_pk_here != pub_bytes:
+                continue
+
+            amount = wutxo.nValue
+
+            try:
+                sighash = SignatureHash(
+                    rs,
+                    unsigned_tx,
+                    idx,
+                    SIGHASH_ALL,
+                    amount,
+                    SIGVERSION_WITNESS_V0,
+                )
+            except Exception as e:
+                sys.stderr.write(f"Input {idx}: failed computing sighash: {e}\n")
+                continue
+
+            try:
+                sig = priv.sign(sighash) + bytes([SIGHASH_ALL])
+            except Exception as e:
+                sys.stderr.write(f"Input {idx}: signing failed: {e}\n")
+                continue
+
+            try:
+                w = CScriptWitness([b"", sig, rs_bytes])
+                inp.final_script_witness = w
+            except Exception as e:
+                sys.stderr.write(f"Input {idx}: failed to set final witness: {e}\n")
+                continue
 
     missing = []
     for idx, inp in enumerate(psbt.inputs):
@@ -1286,7 +1327,6 @@ def cmd_signreveal(args):
         has_wit_stack = bool(getattr(has_wit, "stack", [])) if has_wit else False
         if not has_wit_stack and not getattr(inp, "final_script_sig", b""):
             continue
-
         if getattr(inp, "witness_script", None):
             inp.witness_script = CScript(b"")
 
