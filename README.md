@@ -19,6 +19,7 @@ $ python3 bpub.py fundpsbt monkey.jpg \
   --mime image/jpeg \
   --filename monkey.jpg \
   --control-pubkey CONTROL_PUBKEY \
+  --owner-address bc1q... \
   --utxo txid:index \
   --value 12345 \
   --change bc1q... \
@@ -69,6 +70,20 @@ $ python3 bpub.py signreveal reveal.psbt \
 
 # recover from tx hex to file
 $ python3 bpub.py txrecover reveal.hex > monkey.jpg
+
+# create transfer ownership PSBT (self -> self transfer reveals owner)
+$ python3 bpub.py ownertransferpsbt \
+  --bpub-id 822228cfc784c88df8f9299508961a26cf3ade55930aa2a42089b271598991ba \
+  --current-owner-address bc1q... \
+  --new-owner-address bc1q... \
+  --feerate 1 \
+  --owner-utxo <funding_txid>:26:10000 > owner-transfer.psbt
+
+# sign transfer ownership PSBT
+$ python3 bpub.py signreveal \
+  owner-transfer.psbt --wif <owner-address-wif> > owner-transfer.hex
+
+<broadcast transfer tx>
 
 # run indexer (scans for embedded data on-chain)
 $ python3 indexer.py

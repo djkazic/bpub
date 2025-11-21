@@ -25,6 +25,7 @@ import sys
 import time
 import json
 import re
+import hashlib
 from pathlib import Path
 from typing import Optional, Tuple, List
 
@@ -33,8 +34,9 @@ from bitcoinrpc.authproxy import AuthServiceProxy
 
 from bitcointx.core import CTransaction
 from bitcointx.core.script import CScript
+from bitcointx.wallet import P2WPKHBitcoinAddress, P2WSHBitcoinAddress
 
-from bpub import decode_pubkeys_to_stream, decode_stream
+from bpub import decode_pubkeys_to_stream, decode_stream, decode_owner_redeem_script
 
 
 def load_config():
@@ -109,6 +111,29 @@ def save_manifest(manifest, manifest_path: Path):
     tmp.replace(manifest_path)
 
 
+def load_ownership(gallery_dir: Path):
+    """Load (or initialize) ownership.json mapping BPUB v5 IDs to current owner info."""
+    ownership_path = gallery_dir / "ownership.json"
+    if ownership_path.exists():
+        try:
+            with open(ownership_path, "r") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                data = {}
+        except Exception:
+            data = {}
+    else:
+        data = {}
+    return data, ownership_path
+
+
+def save_ownership(ownership, ownership_path: Path):
+    tmp = ownership_path.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        json.dump(ownership, f, indent=2, sort_keys=True)
+    tmp.replace(ownership_path)
+
+
 def safe_filename(name: str) -> str:
     """Sanitize filename for filesystem."""
     name = name.strip()
@@ -149,7 +174,7 @@ def guess_extension(mime: Optional[str], existing_name: str) -> str:
 
 def try_extract_bpub_from_tx(rawtx_hex: str):
     """
-    Try to detect and extract a BPUB stream (v3.5 or v4) from a transaction.
+    Try to detect and extract a BPUB stream (v3.5 or v4/v5) from a transaction.
 
     Returns:
       (meta, content) on success, or None if no BPUB-like multisig is found
@@ -239,6 +264,85 @@ def try_extract_bpub_from_tx(rawtx_hex: str):
     return meta, content
 
 
+def try_extract_owner_from_tx(rawtx_hex: str):
+    """
+    Try to detect a BPUB v5 ownership script in a transaction and extract
+    ownership info (bpub_id + owner address + owner UTXOs in that tx).
+
+    Returns:
+      dict with keys:
+        - bpub_id (hex)
+        - owner_h160 (hex)
+        - owner_p2wpkh (address string)
+        - owner_p2wsh (address string)
+        - owner_outputs: list of {vout, value_sats}
+      or None if no owner script is found.
+    """
+    try:
+        tx = CTransaction.deserialize(bytes.fromhex(rawtx_hex))
+    except Exception:
+        return None
+
+    wit = getattr(tx, "wit", None)
+    if wit is None or len(wit.vtxinwit) == 0:
+        return None
+
+    owner_info = None
+
+    for idx, vin in enumerate(tx.vin):
+        if idx >= len(tx.wit.vtxinwit):
+            continue
+
+        inwit = tx.wit.vtxinwit[idx]
+        wstack = list(inwit.scriptWitness.stack)
+        if len(wstack) < 2:
+            continue
+
+        redeem_script = bytes(wstack[-1])
+        try:
+            bpub_id_bytes, owner_h160 = decode_owner_redeem_script(redeem_script)
+        except Exception:
+            continue
+
+        # We found an owner script; derive addresses and outputs.
+        bpub_id_hex = bpub_id_bytes.hex()
+        owner_h160_hex = owner_h160.hex()
+
+        # Outer owner P2WSH scriptPubKey for this redeem_script
+        spk_p2wsh = b"\x00\x20" + hashlib.sha256(redeem_script).digest()
+        owner_p2wsh_addr = str(
+            P2WSHBitcoinAddress.from_scriptPubKey(CScript(spk_p2wsh))
+        )
+
+        # Canonical P2WPKH for the owner hash160 (for human-friendly "owner" display)
+        spk_p2wpkh = b"\x00\x14" + owner_h160
+        owner_p2wpkh_addr = str(
+            P2WPKHBitcoinAddress.from_scriptPubKey(CScript(spk_p2wpkh))
+        )
+
+        # Find owner UTXOs in *this* tx (outputs paying to that P2WSH)
+        owner_outputs = []
+        for vout_index, out in enumerate(tx.vout):
+            if bytes(out.scriptPubKey) == spk_p2wsh:
+                owner_outputs.append(
+                    {
+                        "vout": vout_index,
+                        "value_sats": int(out.nValue),
+                    }
+                )
+
+        owner_info = {
+            "bpub_id": bpub_id_hex,
+            "owner_h160": owner_h160_hex,
+            "owner_p2wpkh": owner_p2wpkh_addr,
+            "owner_p2wsh": owner_p2wsh_addr,
+            "owner_outputs": owner_outputs,
+        }
+        break
+
+    return owner_info
+
+
 def load_state(gallery_dir: Path, default_height: int):
     state_path = gallery_dir / "indexer_state.json"
     if state_path.exists():
@@ -267,6 +371,7 @@ def main():
     gallery_dir.mkdir(parents=True, exist_ok=True)
 
     manifest, known_txids, manifest_path, media_dir = load_manifest(gallery_dir)
+    ownership, ownership_path = load_ownership(gallery_dir)
     current_height, state_path = load_state(gallery_dir, config["start_height"])
 
     sys.stderr.write(
@@ -314,53 +419,85 @@ def main():
                 if not raw_hex:
                     continue
 
+                # 1) Try to extract BPUB content (v3.5/v4/v5) as before.
                 res = try_extract_bpub_from_tx(raw_hex)
-                if not res:
-                    continue
+                if res:
+                    meta, content = res
+                    filename_meta = meta.get("filename") or txid
+                    mime = meta.get("mime")
+                    size = meta.get("size")
+                    bpub_version = meta.get("bpub_version")
 
-                meta, content = res
-                filename_meta = meta.get("filename") or txid
-                mime = meta.get("mime")
-                size = meta.get("size")
-                bpub_version = meta.get("bpub_version")
+                    base_name = safe_filename(filename_meta)
+                    stored_name = guess_extension(mime, base_name)
+                    stored_name = f"{txid}_{stored_name}"
+                    out_path = media_dir / stored_name
 
-                base_name = safe_filename(filename_meta)
-                stored_name = guess_extension(mime, base_name)
-                stored_name = f"{txid}_{stored_name}"
-                out_path = media_dir / stored_name
+                    if not out_path.exists():
+                        try:
+                            with open(out_path, "wb") as f:
+                                f.write(content)
+                        except Exception as e:
+                            sys.stderr.write(
+                                f"[ERROR] Failed to write file for tx {txid}: {e}\n"
+                            )
+                            # even if file write fails, we can still attempt ownership below
+                            # so do NOT 'continue' here
+                    entry = {
+                        "txid": txid,
+                        "block_height": current_height,
+                        "block_hash": blockhash,
+                        "time": block_time,
+                        "filename": meta.get("filename"),
+                        "stored_filename": stored_name,
+                        "mime": mime,
+                        "size": size,
+                        "bpub_version": bpub_version,
+                    }
 
-                if not out_path.exists():
+                    # If this is BPUB v5 and we have a bpub_id, persist it on the manifest entry.
+                    bpub_id_val = meta.get("bpub_id")
+                    if bpub_id_val is not None:
+                        if isinstance(bpub_id_val, (bytes, bytearray)):
+                            entry["bpub_id"] = bpub_id_val.hex()
+                        else:
+                            entry["bpub_id"] = str(bpub_id_val)
+
+                    manifest.append(entry)
+                    known_txids.add(txid)
+                    sys.stderr.write(
+                        f"[FOUND] BPUB v{bpub_version} file in tx {txid}: "
+                        f"{stored_name} ({size} bytes, mime={mime})\n"
+                    )
+
                     try:
-                        with open(out_path, "wb") as f:
-                            f.write(content)
+                        save_manifest(manifest, manifest_path)
+                    except Exception as e:
+                        sys.stderr.write(f"[ERROR] Failed to save manifest.json: {e}\n")
+
+                # 2) Independently, try to detect BPUB v5 ownership updates in this tx.
+                owner_info = try_extract_owner_from_tx(raw_hex)
+                if owner_info:
+                    bpub_id_hex = owner_info["bpub_id"]
+                    record = {
+                        "bpub_id": bpub_id_hex,
+                        "current_owner_p2wpkh": owner_info["owner_p2wpkh"],
+                        "txid": txid,
+                        "block_height": current_height,
+                        "block_hash": blockhash,
+                        "time": block_time,
+                        "outputs": owner_info["owner_outputs"],
+                    }
+                    ownership[bpub_id_hex] = record
+                    sys.stderr.write(
+                        f"[FOUND] BPUB v5 ownership update for {bpub_id_hex} in tx {txid}\n"
+                    )
+                    try:
+                        save_ownership(ownership, ownership_path)
                     except Exception as e:
                         sys.stderr.write(
-                            f"[ERROR] Failed to write file for tx {txid}: {e}\n"
+                            f"[ERROR] Failed to save ownership.json: {e}\n"
                         )
-                        continue
-
-                entry = {
-                    "txid": txid,
-                    "block_height": current_height,
-                    "block_hash": blockhash,
-                    "time": block_time,
-                    "filename": meta.get("filename"),
-                    "stored_filename": stored_name,
-                    "mime": mime,
-                    "size": size,
-                    "bpub_version": bpub_version,
-                }
-                manifest.append(entry)
-                known_txids.add(txid)
-                sys.stderr.write(
-                    f"[FOUND] BPUB v{bpub_version} file in tx {txid}: "
-                    f"{stored_name} ({size} bytes, mime={mime})\n"
-                )
-
-                try:
-                    save_manifest(manifest, manifest_path)
-                except Exception as e:
-                    sys.stderr.write(f"[ERROR] Failed to save manifest.json: {e}\n")
 
             current_height += 1
             save_state(state_path, current_height)
