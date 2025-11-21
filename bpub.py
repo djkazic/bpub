@@ -1683,7 +1683,7 @@ def cmd_decodetransfer(args):
     out = {
         "bpub_id": bpub_id.hex(),
         "owner_h160": owner_h160.hex(),
-        "owner_p2wsh": str(owner_p2wsh_addr),
+        "owner_p2wpkh_addr": str(owner_p2wpkh_addr),
         "owner_outputs": owner_outputs,
     }
     sys.stdout.write(json.dumps(out, sort_keys=True, indent=2) + "\n")
