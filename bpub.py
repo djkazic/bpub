@@ -691,6 +691,14 @@ def estimate_fee_reveal(n_inputs: int, n_outputs: int, feerate: int) -> int:
     return vbytes * feerate
 
 
+def estimate_fee_ot(n_inputs: int, n_outputs: int, feerate: int) -> int:
+    base_vbytes = 10
+    in_vbytes = n_inputs * 94
+    out_vbytes = n_outputs * 34
+    vbytes = base_vbytes + in_vbytes + out_vbytes
+    return vbytes * feerate
+
+
 def chunk_data_pubkeys(pubkeys):
     max_data = MAX_PUBKEYS_PER_SCRIPT - 1
     chunk = []
@@ -1187,7 +1195,9 @@ def cmd_signreveal(args):
                 pass
 
         def hash160(pubkey_bytes: bytes) -> bytes:
-            return hashlib.new("ripemd160", hashlib.sha256(pubkey_bytes).digest()).digest()
+            return hashlib.new(
+                "ripemd160", hashlib.sha256(pubkey_bytes).digest()
+            ).digest()
 
         for idx, inp in enumerate(psbt.inputs):
             wit_script = getattr(inp, "witness_script", None)
@@ -1209,7 +1219,9 @@ def cmd_signreveal(args):
 
             wutxo = getattr(inp, "witness_utxo", None)
             if wutxo is None:
-                sys.stderr.write(f"Input {idx}: no witness_utxo -> cannot sign owner.\n")
+                sys.stderr.write(
+                    f"Input {idx}: no witness_utxo -> cannot sign owner.\n"
+                )
                 continue
 
             amount = wutxo.nValue
@@ -1268,7 +1280,9 @@ def cmd_signreveal(args):
             op_check = elems[-1]
 
             is_op_1 = isinstance(op_1, int) and (op_1 == 0x51 or op_1 == 1)
-            is_op_checkmultisig = isinstance(op_check, int) and (op_check in (0xAE, 174))
+            is_op_checkmultisig = isinstance(op_check, int) and (
+                op_check in (0xAE, 174)
+            )
 
             if not (is_op_1 and is_op_checkmultisig and isinstance(op_n, int)):
                 continue
@@ -1551,15 +1565,13 @@ def cmd_ownertransferpsbt(args):
     except ValueError as e:
         sys.exit(str(e))
 
-    # Build current and new owner redeem scripts
     cur_redeem = build_owner_redeem_script(bpub_id, cur_owner_h160)
     new_redeem = build_owner_redeem_script(bpub_id, new_owner_h160)
 
     cur_spk = p2wsh_scriptpubkey(cur_redeem)
     new_spk = p2wsh_scriptpubkey(new_redeem)
 
-    # Estimate fee: 1 P2WSH input, 1 P2WSH output
-    fee = estimate_fee_reveal(n_inputs=1, n_outputs=1, feerate=args.feerate)
+    fee = estimate_fee_ot(n_inputs=1, n_outputs=1, feerate=args.feerate)
     if utxo.value_sats <= fee:
         sys.exit(
             f"Owner UTXO value ({utxo.value_sats} sats) <= fee estimate ({fee} sats). "

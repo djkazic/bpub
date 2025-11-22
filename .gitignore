@@ -1,4 +1,5 @@
 .env
+seed.txt
 gallery/manifest.json
 gallery/media
 gallery/indexer_state.json
