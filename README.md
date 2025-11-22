@@ -9,7 +9,7 @@ sudo apt update
 sudo apt install -y python3.12-dev libsecp256k1-dev
 
 # Python
-pip install secp256k1 python-bitcointx bip-utils
+pip install secp256k1 python-bitcointx bip-utils requests
 ```
 
 Usage:
