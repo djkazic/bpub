@@ -2,6 +2,8 @@
 
 `bpub` is a method for embedding data on Bitcoin using fake pubkeys that *appear* to be real compressed secp256k1 pubkeys.
 
+Telegram group: https://t.me/+64cfGs_A0JA1ODhh
+
 Dependencies:
 ```
 # Ubuntu
