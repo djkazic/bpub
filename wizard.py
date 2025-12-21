@@ -213,6 +213,7 @@ def get_or_create_seed(context: str) -> Optional[Tuple[bytes, str, str]]:
                 f,
                 indent=2,
             )
+        os.chmod(SEED_FILE, 0o600)
         print(f"\nSeed stored in {SEED_FILE} (PLAINTEXT). Keep it secure.\n")
     except OSError as e:
         print(f"WARNING: Failed to write {SEED_FILE}: {e}")
