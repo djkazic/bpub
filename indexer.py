@@ -26,6 +26,7 @@ import time
 import json
 import re
 import hashlib
+import zlib
 from pathlib import Path
 from typing import Optional, Tuple, List
 
@@ -113,6 +114,7 @@ def save_manifest(manifest, manifest_path: Path):
     tmp = manifest_path.with_suffix(".tmp")
     with open(tmp, "w") as f:
         json.dump(manifest_sorted, f, indent=2)
+    os.chmod(tmp, 0o600)
     tmp.replace(manifest_path)
 
 
@@ -136,6 +138,7 @@ def save_ownership(ownership, ownership_path: Path):
     tmp = ownership_path.with_suffix(".tmp")
     with open(tmp, "w") as f:
         json.dump(ownership, f, indent=2, sort_keys=True)
+    os.chmod(tmp, 0o600)
     tmp.replace(ownership_path)
 
 
@@ -187,7 +190,7 @@ def try_extract_bpub_from_tx(rawtx_hex: str):
     """
     try:
         tx = CTransaction.deserialize(bytes.fromhex(rawtx_hex))
-    except Exception:
+    except (ValueError, TypeError):
         return None
 
     wit = getattr(tx, "wit", None)
@@ -225,7 +228,7 @@ def try_extract_bpub_from_tx(rawtx_hex: str):
     try:
         raw_stream = decode_pubkeys_to_stream(all_data_pubkeys)
         meta, content = decode_stream(raw_stream)
-    except Exception:
+    except (ValueError, zlib.error):
         return None
 
     if "bpub_version" not in meta:
@@ -250,7 +253,7 @@ def try_extract_owner_from_tx(rawtx_hex: str):
     """
     try:
         tx = CTransaction.deserialize(bytes.fromhex(rawtx_hex))
-    except Exception:
+    except (ValueError, TypeError):
         return None
 
     wit = getattr(tx, "wit", None)
@@ -271,7 +274,7 @@ def try_extract_owner_from_tx(rawtx_hex: str):
         redeem_script = bytes(wstack[-1])
         try:
             bpub_id_bytes, owner_h160 = decode_owner_redeem_script(redeem_script)
-        except Exception:
+        except ValueError:
             continue
 
         # We found an owner script; derive addresses and outputs.
@@ -330,6 +333,7 @@ def save_state(state_path: Path, next_height: int):
     tmp = state_path.with_suffix(".tmp")
     with open(tmp, "w") as f:
         json.dump({"next_height": next_height}, f)
+    os.chmod(tmp, 0o600)
     tmp.replace(state_path)
 
 

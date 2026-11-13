@@ -558,10 +558,9 @@ def decode_stream(payload: bytes):
                 if "bpub_id" in meta_json:
                     try:
                         meta["bpub_id"] = bytes.fromhex(meta_json["bpub_id"])
-                    except Exception:
-                        # if it doesn't parse, leave as-is in hex form
+                    except ValueError:
                         meta["bpub_id"] = meta_json["bpub_id"]
-        except Exception:
+        except (zlib.error, json.JSONDecodeError, UnicodeDecodeError):
             meta["meta_blob"] = meta_blob_enc
 
     content_plain = _xor_obfuscate(content_enc)
@@ -949,13 +948,27 @@ def chunk_data_pubkeys(pubkeys):
         yield chunk
 
 
+def validate_file_path(path: str) -> str:
+    if os.path.isabs(path) or ".." in path.split(os.path.sep):
+        raise ValueError(f"Path traversal not allowed: {path}")
+    return path
+
+
+def positive_int(value: str) -> int:
+    ivalue = int(value)
+    if ivalue <= 0:
+        raise argparse.ArgumentTypeError(f"must be positive: {value}")
+    return ivalue
+
+
 def load_psbt_from_arg(psbt_arg: str) -> PSBT:
     """
     Helper: load a PSBT either from a file path or from a base64 string.
     """
-    # If it's a file on disk, read its contents
     if os.path.isfile(psbt_arg):
-        b64 = open(psbt_arg, "r").read().strip()
+        validate_file_path(psbt_arg)
+        with open(psbt_arg, "r") as f:
+            b64 = f.read().strip()
     else:
         b64 = psbt_arg.strip()
 
@@ -971,7 +984,9 @@ def cmd_encode(args):
     """
     encode: file -> BPUB stream hex (just a helper)
     """
-    data = open(args.file, "rb").read()
+    validate_file_path(args.file)
+    with open(args.file, "rb") as f:
+        data = f.read()
     if args.legacy_v3:
         stream = build_stream_v3_5(data, args.mime, args.filename, args.compress)
     elif args.v4:
@@ -986,7 +1001,9 @@ def cmd_decode(args):
     decode: BPUB stream hex -> raw file bytes
     """
     if os.path.isfile(args.stream_hex):
-        hexdata = open(args.stream_hex, "r").read().strip()
+        validate_file_path(args.stream_hex)
+        with open(args.stream_hex, "r") as f:
+            hexdata = f.read().strip()
     else:
         hexdata = args.stream_hex.strip()
 
@@ -1024,7 +1041,9 @@ def cmd_txbuild(args):
     if len(control_pubkey) != 33:
         sys.exit("control-pubkey must be 33-byte compressed pubkey hex")
 
-    data = open(args.file, "rb").read()
+    validate_file_path(args.file)
+    with open(args.file, "rb") as f:
+        data = f.read()
 
     if args.legacy_v3 and args.v4:
         sys.exit("Cannot specify both --legacy-v3 and --v4")
@@ -1164,7 +1183,9 @@ def cmd_fundpsbt(args):
     if len(control_pubkey) != 33:
         sys.exit("control-pubkey must be 33-byte compressed pubkey hex")
 
-    data = open(args.file, "rb").read()
+    validate_file_path(args.file)
+    with open(args.file, "rb") as f:
+        data = f.read()
 
     if args.legacy_v3 and args.v4:
         sys.exit("Cannot specify both --legacy-v3 and --v4")
@@ -1333,7 +1354,9 @@ def cmd_revealpsbt(args):
     if not args.bpub_utxo:
         sys.exit("Need at least one --bpub-utxo TXID:VOUT:VALUE")
 
-    data = open(args.file, "rb").read()
+    validate_file_path(args.file)
+    with open(args.file, "rb") as f:
+        data = f.read()
     if args.legacy_v3:
         stream = build_stream_v3_5(data, args.mime, args.filename, args.compress)
         version_label = "v3.5 legacy"
@@ -1663,9 +1686,10 @@ def cmd_txrecover(args):
     - After collecting all data pubkeys, we decode them back into a BPUB stream and
       then into the original file (v3.5, v4, or v5).
     """
-
     if os.path.isfile(args.rawtx):
-        rawtx_hex = open(args.rawtx, "r").read().strip()
+        validate_file_path(args.rawtx)
+        with open(args.rawtx, "r") as f:
+            rawtx_hex = f.read().strip()
     else:
         rawtx_hex = args.rawtx.strip()
 
@@ -1790,7 +1814,9 @@ def cmd_ownertransferpsbt(args):
         )
 
     if args.file:
-        data = open(args.file, "rb").read()
+        validate_file_path(args.file)
+        with open(args.file, "rb") as f:
+            data = f.read()
         bpub_id = compute_bpub_v5_id(data)
     else:
         try:
@@ -1866,9 +1892,10 @@ def cmd_decodetransfer(args):
       - owner P2WSH address (the script hash used for the owner UTXO)
       - which outputs in this tx are owner UTXOs (same P2WSH scriptPubKey)
     """
-    # Load raw tx hex (from filename or literal)
     if os.path.isfile(args.rawtx):
-        rawtx_hex = open(args.rawtx, "r").read().strip()
+        validate_file_path(args.rawtx)
+        with open(args.rawtx, "r") as f:
+            rawtx_hex = f.read().strip()
     else:
         rawtx_hex = args.rawtx.strip()
 
@@ -2031,10 +2058,10 @@ def main():
     )
     tb.add_argument("--utxo", required=True, help="funding UTXO as TXID:VOUT")
     tb.add_argument(
-        "--value", required=True, type=int, help="value of funding UTXO in sats"
+        "--value", required=True, type=positive_int, help="value of funding UTXO in sats"
     )
     tb.add_argument(
-        "--feerate", required=True, type=int, help="target feerate in sats/vbyte"
+        "--feerate", required=True, type=positive_int, help="target feerate in sats/vbyte"
     )
     tb.add_argument("--change", help="bech32 change address (optional)")
     tb.add_argument(
@@ -2101,10 +2128,10 @@ def main():
     )
     fp.add_argument("--utxo", required=True, help="funding UTXO as TXID:VOUT")
     fp.add_argument(
-        "--value", required=True, type=int, help="value of that UTXO in sats"
+        "--value", required=True, type=positive_int, help="value of that UTXO in sats"
     )
     fp.add_argument(
-        "--feerate", required=True, type=int, help="target feerate in sats/vbyte"
+        "--feerate", required=True, type=positive_int, help="target feerate in sats/vbyte"
     )
     fp.add_argument("--change", help="bech32 change address (recommended)")
     fp.add_argument(
@@ -2182,7 +2209,7 @@ def main():
         "--change", required=True, help="bech32 address to receive swept funds"
     )
     rp.add_argument(
-        "--feerate", type=int, default=1, help="target feerate in sats/vbyte"
+        "--feerate", type=positive_int, default=1, help="target feerate in sats/vbyte"
     )
     rp.add_argument(
         "--legacy-scripts",
@@ -2261,7 +2288,7 @@ def main():
         help="current owner UTXO as TXID:VOUT:VALUE",
     )
     ot.add_argument(
-        "--feerate", type=int, default=1, help="target feerate in sats/vbyte"
+        "--feerate", type=positive_int, default=1, help="target feerate in sats/vbyte"
     )
     ot.set_defaults(func=cmd_ownertransferpsbt)
 
