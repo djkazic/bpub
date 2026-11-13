@@ -23,6 +23,64 @@ OP_(M+1)
 OP_CHECKMULTISIG
 ```
 
+### Script padding suffix (v2)
+
+By default the script also carries a padding suffix after
+`OP_CHECKMULTISIG`:
+
+```
+OP_TOALTSTACK
+OP_SIZE <64> OP_EQUAL OP_NOTIF
+OP_CHECKSIG x13
+OP_ENDIF
+OP_2DROP OP_2DROP OP_2DROP OP_2DROP OP_2DROP OP_2DROP OP_DROP
+OP_FROMALTSTACK
+```
+
+The reveal witness then carries 13 padding items before the usual
+`[dummy, signature, script]` stack. Each padding item is exactly 64 bytes:
+
+```
+0x30 0x3d 02 0x1c <28B r> 0x02 0x1d <29B s> 0x01
+```
+
+with `r`/`s` derived deterministically as `sha512("BPUB-PAD-ITEM" || script
+|| index)`, first bytes masked so they are nonzero and below 0x80. The
+script discards the padding items via `OP_TOALTSTACK`/`OP_2DROP`/`OP_DROP`
+/`OP_FROMALTSTACK` around the 1-of-N spend; the guard's `<64>` assertion
+must equal the padding item size, and the `OP_NOTIF` branch never executes.
+
+Reveal witness layout (newest last):
+
+```
+<pad_0> ... <pad_12> <CHECKMULTISIG dummy = ""> <signature> <redeemScript>
+```
+
+**v1 suffix (legacy).** The first version used `OP_TOALTSTACK`, the drops,
+`OP_FROMALTSTACK`, then `OP_1 OP_NOTIF <13 OP_CHECKSIG> OP_ENDIF`. It is no
+longer buildable, but the parser, indexer, and `signreveal` still recognize
+it, so v1-funded outputs can still be recovered and spent (the v1 script
+can be reconstructed from this spec if ever needed). Use
+`--legacy-scripts` for UTXOs funded before any suffix existed.
+
+### Funding output values
+
+A padded reveal input measures ~406 vB on average (the fee estimator uses
+450 vB for headroom), so 546-sat funding outputs cannot always pay for
+their own reveal. `txbuild`/`fundpsbt` therefore size each BPUB data
+output by default to cover its share of the reveal at the assumed reveal
+feerate (`--reveal-feerate`, defaulting to the funding feerate):
+
+```
+value_i = max(546, 450 * reveal_feerate + ceil((134 * reveal_feerate + 546) / n)) + i
+```
+
+where `134` vB is the reveal's fixed overhead (base + one output) and `n`
+the number of data outputs. The `+ 546 / n` share guarantees the reveal's
+change output clears the dust floor, and the `+ i` staggering ensures no
+three P2WSH outputs share a single value <= 546 sats. `--bpub-value`
+overrides the sizing with an exact per-output value.
+
 Version 5 introduces **mandatory ownership**, using a separate P2WSH output:
 ```
 <BPUB_ID>

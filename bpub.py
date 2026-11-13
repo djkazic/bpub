@@ -29,9 +29,10 @@ Versions:
 
         where owner_h160 = HASH160(owner_pubkey) of the P2WPKH owner address.
 
-The on-chain multisig/P2WSH structure for data anchors is unchanged; only the
-BPUB stream encoded into fake pubkeys and the mandatory v5 ownership outputs
-are new in v5 (this tool enforces ownership for v5).
+The on-chain multisig/P2WSH structure for data anchors additionally carries a
+padding suffix by default, and reveal witnesses carry matching padding items
+(see the PAD_* section below). Build funding/reveal with --legacy-scripts
+to use the legacy suffix-free scripts.
 """
 
 import os
@@ -84,6 +85,114 @@ MAX_PUBKEYS_PER_SCRIPT = 15  # 1-of-15 multisig -> 14 data pubkeys + 1 control p
 
 # XOR obfuscation salt for v4/v5 streams (public, fixed; not meant as secret)
 V4_XOR_SALT = b"\x53\x6a\x19\xa1"
+
+# ---------------------------------------------------------------------------
+# Script padding (v2)
+# ---------------------------------------------------------------------------
+#
+# Multisig scripts carry a compatibility suffix, and reveal witnesses carry
+# matching padding items, generated deterministically from the script.
+#
+# Invariants (all load-bearing):
+#   - exactly PAD_WITNESS_ITEMS padding witness items per input,
+#   - exactly PAD_CHECKSIGS padding opcodes in the suffix,
+#   - every padding item is exactly PAD_ITEM_SIZE bytes; the suffix's
+#     OP_SIZE guard asserts this size at execution.
+#
+# Keep these three in sync; tests/test_script_padding.py pins them.
+
+PAD_WITNESS_ITEMS = 13
+PAD_CHECKSIGS = 13
+# Padding item size; see make_pad_items for the byte format.
+PAD_ITEM_SIZE = 64
+
+_OP_1 = 0x51
+_OP_NOTIF = 0x64
+_OP_ENDIF = 0x68
+_OP_TOALTSTACK = 0x6B
+_OP_FROMALTSTACK = 0x6C
+_OP_2DROP = 0x6D
+_OP_DROP = 0x75
+_OP_SIZE = 0x82
+_OP_EQUAL = 0x87
+_OP_CHECKSIG = 0xAC
+_OP_CHECKMULTISIG = 0xAE
+
+
+def _pad_suffix_elems(version: int = 2):
+    """
+    Script elements (ints for opcodes, bytes for data pushes) appended after
+    OP_CHECKMULTISIG.
+
+    v2 (current):
+
+        OP_TOALTSTACK                 ; stash the multisig result
+        OP_SIZE <64> OP_EQUAL OP_NOTIF ; guard over a padding item (true at
+                                      ; execution)
+        OP_CHECKSIG * 13              ; padding opcodes, never executed
+        OP_ENDIF
+        OP_2DROP * 6, OP_DROP         ; discard the padding witness items
+        OP_FROMALTSTACK               ; restore the result
+
+    v1 (legacy): OP_TOALTSTACK, OP_2DROP*6, OP_DROP, OP_FROMALTSTACK, then
+    `OP_1 OP_NOTIF <13 OP_CHECKSIG> OP_ENDIF`. No longer buildable; still
+    parseable and signable for already-funded outputs.
+    """
+    if version == 1:
+        return (
+            [_OP_TOALTSTACK]
+            + [_OP_2DROP] * 6
+            + [_OP_DROP]
+            + [_OP_FROMALTSTACK]
+            + [_OP_1, _OP_NOTIF]
+            + [_OP_CHECKSIG] * PAD_CHECKSIGS
+            + [_OP_ENDIF]
+        )
+    return (
+        [_OP_TOALTSTACK, _OP_SIZE, bytes([PAD_ITEM_SIZE]), _OP_EQUAL, _OP_NOTIF]
+        + [_OP_CHECKSIG] * PAD_CHECKSIGS
+        + [_OP_ENDIF]
+        + [_OP_2DROP] * 6
+        + [_OP_DROP]
+        + [_OP_FROMALTSTACK]
+    )
+
+
+def _serialize_elems(elems) -> bytes:
+    out = bytearray()
+    for e in elems:
+        if isinstance(e, (bytes, bytearray)):
+            if not 0 < len(e) < 0x4C:
+                raise ValueError("only direct pushes supported")
+            out.append(len(e))
+            out.extend(e)
+        else:
+            out.append(e)
+    return bytes(out)
+
+
+def make_pad_items(script_bytes: bytes):
+    """
+    Deterministic padding witness items for a padded script.
+
+    Each is exactly PAD_ITEM_SIZE (64) bytes:
+
+        0x30 0x3d  0x02 0x1c <28-byte r>  0x02 0x1d <29-byte s>  0x01
+
+    They are dropped by the script without being inspected, so the content
+    is arbitrary; deriving it from the script keeps signing deterministic.
+    The high bits of the first r/s bytes are masked and zero first bytes are
+    avoided.
+    """
+    items = []
+    for i in range(PAD_WITNESS_ITEMS):
+        seed = hashlib.sha512(
+            b"BPUB-PAD-ITEM" + script_bytes + bytes([i])
+        ).digest()
+        r = bytes([(seed[0] & 0x7F) or 1]) + seed[1:28]
+        s = bytes([(seed[28] & 0x7F) or 1]) + seed[29:57]
+        items.append(b"\x30\x3d\x02\x1c" + r + b"\x02\x1d" + s + b"\x01")
+    return items
 
 
 def is_quadratic_residue(n: int) -> bool:
@@ -479,7 +588,9 @@ def decode_stream(payload: bytes):
 # ---------------------------------------------------------------------------
 
 
-def build_multisig_script(data_pubkeys, control_pubkey: bytes) -> CScript:
+def build_multisig_script(
+    data_pubkeys, control_pubkey: bytes, pad_suffix: bool = True
+) -> CScript:
     """
     Build a 1-of-N multisig script:
 
@@ -488,6 +599,12 @@ def build_multisig_script(data_pubkeys, control_pubkey: bytes) -> CScript:
     where:
       - len(data_pubkeys) + 1 <= MAX_PUBKEYS_PER_SCRIPT
       - `control_pubkey` is a 33-byte compressed SEC pubkey with a real private key.
+
+    With pad_suffix=True (the default), the current (v2) padding suffix is
+    appended and the reveal witness must include the items from
+    make_pad_items(); see the notes at the top of this file. The older v1
+    suffix is no longer buildable but remains parseable/signable for
+    recovery.
     """
     if len(control_pubkey) != 33:
         raise ValueError("control_pubkey must be 33-byte compressed SEC pubkey")
@@ -498,11 +615,8 @@ def build_multisig_script(data_pubkeys, control_pubkey: bytes) -> CScript:
             f"Too many pubkeys in one script (max {MAX_PUBKEYS_PER_SCRIPT})"
         )
 
-    OP_1 = 0x51
-    OP_CHECKMULTISIG = 0xAE
-
     scr = bytearray()
-    scr.append(OP_1)
+    scr.append(_OP_1)
 
     for pk in data_pubkeys:
         scr.append(0x21)  # PUSH 33
@@ -512,9 +626,89 @@ def build_multisig_script(data_pubkeys, control_pubkey: bytes) -> CScript:
     scr.extend(control_pubkey)
 
     scr.append(0x50 + total_keys)  # OP_(M+1), e.g. OP_15 etc.
-    scr.append(OP_CHECKMULTISIG)
+    scr.append(_OP_CHECKMULTISIG)
+
+    if pad_suffix:
+        scr.extend(_serialize_elems(_pad_suffix_elems(2)))
 
     return CScript(scr)
+
+
+def parse_bpub_multisig(script_bytes: bytes):
+    """
+    Parse a BPUB multisig redeem script.
+
+    Returns:
+      (data_pubkeys, control_pubkey, suffix) on match, where suffix is one of
+        - "none":       legacy script, nothing after OP_CHECKMULTISIG
+        - "padv1":      the v1 padding suffix
+        - "padv2":      the v2 padding suffix
+        - "unknown":    anything else trails OP_CHECKMULTISIG; the data
+                        pubkeys are still usable (indexer/recovery), but
+                        signreveal refuses these because it cannot build the
+                        right witness
+      None if the script is not a BPUB 1-of-N multisig.
+
+    Parsing is deliberately lenient about trailing ops: a future suffix
+    variant must not make existing indexer/recovery tooling silently skip
+    transactions.
+    """
+    try:
+        elems = list(CScript(script_bytes))
+    except Exception:
+        return None
+
+    def is_op_1(e):
+        return isinstance(e, int) and (e == 0x51 or e == 1)
+
+    if len(elems) < 4 or not is_op_1(elems[0]):
+        return None
+
+    # <data_pk_0> ... <control_pubkey>
+    i = 1
+    pubkeys = []
+    while i < len(elems) and isinstance(elems[i], (bytes, bytearray)):
+        pubkeys.append(bytes(elems[i]))
+        i += 1
+    if len(pubkeys) < 2:
+        return None
+
+    # OP_(M+1) (bitcointx may decode small-int opcodes as Python ints 1..16)
+    if i >= len(elems) or not isinstance(elems[i], int):
+        return None
+    op_n = elems[i]
+    n = op_n - 0x50 if op_n >= 0x51 else op_n
+    if n != len(pubkeys):
+        return None
+    i += 1
+
+    # OP_CHECKMULTISIG
+    if i >= len(elems) or not (
+        isinstance(elems[i], int) and elems[i] in (0xAE, 174)
+    ):
+        return None
+    i += 1
+
+    rest = elems[i:]
+    if not rest:
+        suffix = "none"
+    else:
+        # bitcointx may decode small-int opcodes as Python ints 1..16;
+        # normalize them to OP_N byte values for comparison.
+        def norm(e):
+            if isinstance(e, int) and 1 <= e <= 16:
+                return 0x50 + e
+            return e
+
+        got = [norm(e) for e in rest]
+        if got == [norm(e) for e in _pad_suffix_elems(1)]:
+            suffix = "padv1"
+        elif got == [norm(e) for e in _pad_suffix_elems(2)]:
+            suffix = "padv2"
+        else:
+            suffix = "unknown"
+
+    return pubkeys[:-1], pubkeys[-1], suffix
 
 
 def decode_owner_redeem_script(redeem_script_bytes: bytes):
@@ -683,12 +877,56 @@ def estimate_fee_funding(
     return vbytes * feerate
 
 
-def estimate_fee_reveal(n_inputs: int, n_outputs: int, feerate: int) -> int:
-    base_vbytes = 100
-    in_vbytes = n_inputs * 188
+# Reveal transaction size model. With the padding suffix each input also
+# carries the padding witness items, so it measures ~406 vB on average
+# (varies with signature size and chunk count). REVEAL_INPUT_VBYTES is
+# deliberately ~11% above that: underestimating the fee silently lowers the
+# reveal's actual feerate (and can strand the change output under dust),
+# while overestimating only grows the change output.
+REVEAL_BASE_VBYTES = 100
+REVEAL_INPUT_VBYTES = 450
+REVEAL_INPUT_VBYTES_LEGACY = 188
+
+# Dust floor used for BPUB data outputs (matches the P2PKH-style dust
+# threshold the project has always used for its P2WSH outputs).
+BPUB_DUST = 546
+
+
+def estimate_fee_reveal(
+    n_inputs: int, n_outputs: int, feerate: int, pad_suffix: bool = True
+) -> int:
+    in_vbytes = n_inputs * (
+        REVEAL_INPUT_VBYTES if pad_suffix else REVEAL_INPUT_VBYTES_LEGACY
+    )
     out_vbytes = n_outputs * 34
-    vbytes = base_vbytes + in_vbytes + out_vbytes
+    vbytes = REVEAL_BASE_VBYTES + in_vbytes + out_vbytes
     return vbytes * feerate
+
+
+def bpub_output_values(n_outputs: int, reveal_feerate: int, bpub_value: int = None):
+    """
+    Per-output values (sats) for BPUB funding outputs.
+
+    Default: each output covers its share of the reveal at `reveal_feerate`
+    (REVEAL_INPUT_VBYTES per input plus an equal share of the fixed
+    overhead and of the change output's dust floor), never below BPUB_DUST,
+    so a reveal at the assumed feerate always clears the change-is-dust
+    check. Values are staggered by 1 sat so no three outputs share a single
+    value <= BPUB_DUST.
+
+    An explicit bpub_value overrides the sizing and is used exactly
+    (no staggering).
+    """
+    if n_outputs < 1:
+        return []
+    if bpub_value is not None:
+        return [bpub_value] * n_outputs
+    fixed_share = (
+        (REVEAL_BASE_VBYTES + 34) * reveal_feerate + BPUB_DUST + n_outputs - 1
+    ) // n_outputs
+    share = REVEAL_INPUT_VBYTES * reveal_feerate + fixed_share
+    base = max(BPUB_DUST, share)
+    return [base + i for i in range(n_outputs)]
 
 
 def estimate_fee_ot(n_inputs: int, n_outputs: int, feerate: int) -> int:
@@ -817,7 +1055,11 @@ def cmd_txbuild(args):
     bpub_spks = []
     n_outputs = 0
     for chunk in chunk_data_pubkeys(data_pubkeys):
-        rs = build_multisig_script(chunk, control_pubkey)
+        rs = build_multisig_script(
+            chunk,
+            control_pubkey,
+            pad_suffix=not getattr(args, "legacy_scripts", False),
+        )
         redeem_scripts.append(rs)
         bpub_spks.append(p2wsh_scriptpubkey(rs))
         n_outputs += 1
@@ -858,14 +1100,17 @@ def cmd_txbuild(args):
             )
         values = [per_out] * len(bpub_spks)
     else:
-        bpub_total = len(bpub_spks) * DUST
+        reveal_feerate = getattr(args, "reveal_feerate", None) or args.feerate
+        values = bpub_output_values(
+            len(bpub_spks), reveal_feerate, getattr(args, "bpub_value", None)
+        )
+        bpub_total = sum(values)
         owner_total = DUST if owner_spk is not None else 0
         if change_value <= bpub_total + owner_total:
             sys.exit(
                 f"Not enough for BPUB outputs + owner (if any) + change, "
                 f"need > {bpub_total + owner_total} sats"
             )
-        values = [DUST] * len(bpub_spks)
         owner_value = 10000 if owner_spk is not None else 0
         change_value = utxo.value_sats - fee - bpub_total - owner_value
         if change_value < DUST:
@@ -887,9 +1132,15 @@ def cmd_txbuild(args):
     tx = CMutableTransaction([txin], txouts)
 
     raw = tx.serialize().hex()
+    sizing_note = ""
+    if include_change and getattr(args, "bpub_value", None) is None:
+        assumed = getattr(args, "reveal_feerate", None) or args.feerate
+        sizing_note = f"# Output sizing assumes a reveal at {assumed} sat/vB\n"
     sys.stderr.write(
         f"# Built BPUB {bpub_version} funding tx with 1 input, {len(txouts)} outputs, "
         f"{len(redeem_scripts)} BPUB data outputs, fee≈{fee} sats\n"
+        f"# BPUB output values: {min(values)}..{max(values)} sats each\n"
+        f"{sizing_note}"
     )
     if bpub_id is not None:
         sys.stderr.write(f"# BPUB v5 ID (for ownership): {bpub_id.hex()}\n")
@@ -943,7 +1194,11 @@ def cmd_fundpsbt(args):
     redeem_scripts = []
     bpub_spks = []
     for chunk in chunk_data_pubkeys(data_pubkeys):
-        rs = build_multisig_script(chunk, control_pubkey)
+        rs = build_multisig_script(
+            chunk,
+            control_pubkey,
+            pad_suffix=not getattr(args, "legacy_scripts", False),
+        )
         redeem_scripts.append(rs)
         bpub_spks.append(p2wsh_scriptpubkey(rs))
 
@@ -988,14 +1243,17 @@ def cmd_fundpsbt(args):
         values = [per_out] * len(bpub_spks)
         change_value = 0
     else:
-        bpub_total = len(bpub_spks) * DUST
+        reveal_feerate = getattr(args, "reveal_feerate", None) or args.feerate
+        values = bpub_output_values(
+            len(bpub_spks), reveal_feerate, getattr(args, "bpub_value", None)
+        )
+        bpub_total = sum(values)
         owner_total = DUST if owner_spk is not None else 0
         if utxo.value_sats - fee <= bpub_total + owner_total:
             sys.exit(
                 f"Not enough for BPUB outputs + owner (if any) + fee, "
                 f"need > {bpub_total + owner_total + fee} sats"
             )
-        values = [DUST] * len(bpub_spks)
         owner_value = 10000 if owner_spk is not None else 0
         change_value = utxo.value_sats - fee - bpub_total - owner_value
         if change_value < DUST:
@@ -1035,9 +1293,15 @@ def cmd_fundpsbt(args):
         force_witness_utxo=True,
     )
 
+    sizing_note = ""
+    if include_change and getattr(args, "bpub_value", None) is None:
+        assumed = getattr(args, "reveal_feerate", None) or args.feerate
+        sizing_note = f"# Output sizing assumes a reveal at {assumed} sat/vB\n"
     sys.stderr.write(
         f"# Built BPUB {bpub_version} funding PSBT with 1 input, {len(txouts)} outputs, "
         f"{len(redeem_scripts)} BPUB data outputs, fee≈{fee} sats\n"
+        f"# BPUB output values: {min(values)}..{max(values)} sats each\n"
+        f"{sizing_note}"
     )
     if bpub_id is not None:
         sys.stderr.write(f"# BPUB v5 ID (for ownership): {bpub_id.hex()}\n")
@@ -1093,7 +1357,14 @@ def cmd_revealpsbt(args):
         except ValueError:
             sys.exit(f"Bad --bpub-utxo format: {u} (need TXID:VOUT:VALUE)")
 
-    if len(utxos) != expected_scripts:
+    if len(utxos) > expected_scripts:
+        # Surplus inputs would get no witness_script and could never be
+        # finalized, so refuse rather than emit a broken PSBT.
+        sys.exit(
+            f"Too many BPUB UTXOs ({len(utxos)}) for the scripts needed "
+            f"({expected_scripts}); provide exactly one per data output"
+        )
+    if len(utxos) < expected_scripts:
         sys.stderr.write(
             f"# WARNING: number of BPUB UTXOs ({len(utxos)}) does not match "
             f"number of scripts needed ({expected_scripts}). Proceeding anyway.\n"
@@ -1101,15 +1372,22 @@ def cmd_revealpsbt(args):
 
     total_in = sum(u.value_sats for u in utxos)
 
+    pad_suffix = not getattr(args, "legacy_scripts", False)
     redeem_scripts = [
-        build_multisig_script(chunk, control_pubkey) for chunk in script_chunks
+        build_multisig_script(chunk, control_pubkey, pad_suffix=pad_suffix)
+        for chunk in script_chunks
     ]
 
     if len(redeem_scripts) > len(utxos):
         sys.exit("Not enough BPUB UTXOs provided for all data chunks")
 
     # Estimate fee: n_inputs = len(utxos), n_outputs = 1
-    fee = estimate_fee_reveal(n_inputs=len(utxos), n_outputs=1, feerate=args.feerate)
+    fee = estimate_fee_reveal(
+        n_inputs=len(utxos),
+        n_outputs=1,
+        feerate=args.feerate,
+        pad_suffix=pad_suffix,
+    )
     if total_in <= fee:
         sys.exit(f"Total BPUB UTXO value ({total_in}) <= fee ({fee})")
 
@@ -1136,10 +1414,27 @@ def cmd_revealpsbt(args):
         psbt.set_utxo(prevout, idx, force_witness_utxo=True)
         psbt.inputs[idx].witness_script = rs
 
+    # Report the feerate these UTXO values reserve (per the funding sizing
+    # formula: reveal fee + dust share + 1-sat stagger) and the hard ceiling
+    # where the change output turns to dust.
+    per_input_vb = (
+        REVEAL_INPUT_VBYTES if pad_suffix else REVEAL_INPUT_VBYTES_LEGACY
+    )
+    total_vb = REVEAL_BASE_VBYTES + 34 + per_input_vb * len(utxos)
+    stagger = len(utxos) * (len(utxos) - 1) // 2
+    reserved_feerate = (total_in - DUST - stagger) // total_vb
+    max_feerate = (total_in - DUST) // total_vb
     sys.stderr.write(
         f"# Built BPUB {version_label} reveal PSBT with {len(utxos)} inputs, 1 output, "
         f"fee≈{fee} sats\n"
+        f"# UTXO values reserve ~{reserved_feerate} sat/vB for the reveal "
+        f"(dust ceiling ~{max_feerate} sat/vB; requested: {args.feerate} sat/vB)\n"
     )
+    if args.feerate > reserved_feerate:
+        sys.stderr.write(
+            "# WARNING: requested feerate exceeds what the funded values "
+            "reserve; the reveal is spending the sizing margin.\n"
+        )
     sys.stdout.write(psbt.to_base64() + "\n")
 
 
@@ -1266,33 +1561,21 @@ def cmd_signreveal(args):
             rs = wit_script
             rs_bytes = bytes(rs)
 
-            try:
-                elems = list(CScript(rs_bytes))
-            except Exception:
-                sys.stderr.write(f"Input {idx}: redeemScript parse failed; skipping.\n")
+            parsed = parse_bpub_multisig(rs_bytes)
+            if parsed is None:
+                sys.stderr.write(
+                    f"Input {idx}: not a BPUB multisig script; skipping.\n"
+                )
                 continue
 
-            if len(elems) < 4:
+            _data_pks, control_pk_here, suffix_kind = parsed
+            if suffix_kind == "unknown":
+                sys.stderr.write(
+                    f"Input {idx}: unrecognized script suffix; refusing to "
+                    "guess the witness layout. Sign with an older/newer "
+                    "bpub version that knows this variant.\n"
+                )
                 continue
-
-            op_1 = elems[0]
-            op_n = elems[-2]
-            op_check = elems[-1]
-
-            is_op_1 = isinstance(op_1, int) and (op_1 == 0x51 or op_1 == 1)
-            is_op_checkmultisig = isinstance(op_check, int) and (
-                op_check in (0xAE, 174)
-            )
-
-            if not (is_op_1 and is_op_checkmultisig and isinstance(op_n, int)):
-                continue
-
-            middle = elems[1:-2]
-            pubkeys = [e for e in middle if isinstance(e, (bytes, bytearray))]
-            if not pubkeys or len(pubkeys) != len(middle):
-                continue
-
-            control_pk_here = pubkeys[-1]
             if control_pk_here != pub_bytes:
                 continue
 
@@ -1318,7 +1601,12 @@ def cmd_signreveal(args):
                 continue
 
             try:
-                w = CScriptWitness([b"", sig, rs_bytes])
+                if suffix_kind in ("padv1", "padv2"):
+                    # Padded script: the witness must carry the padding items.
+                    stack = make_pad_items(rs_bytes) + [b"", sig, rs_bytes]
+                else:
+                    stack = [b"", sig, rs_bytes]
+                w = CScriptWitness(stack)
                 inp.final_script_witness = w
             except Exception as e:
                 sys.stderr.write(f"Input {idx}: failed to set final witness: {e}\n")
@@ -1418,50 +1706,11 @@ def cmd_txrecover(args):
         # Multisig P2WSH spends usually have witness:
         #   <dummy or sigs...> <redeemScript>
         redeem_script = bytes(wstack[-1])
-        try:
-            elems = list(CScript(redeem_script))
-        except Exception:
+        parsed = parse_bpub_multisig(redeem_script)
+        if parsed is None:
             continue
 
-        # Expect pattern: OP_1, <33B>*..., OP_(M+1), OP_CHECKMULTISIG
-        if len(elems) < 4:
-            continue
-
-        op_1 = elems[0]
-        op_n = elems[-2]
-        op_checkmultisig = elems[-1]
-
-        # bitcointx often parses small integer opcodes as Python ints 1..16
-        # rather than raw opcode bytes, so accept both representations.
-        is_op_1 = isinstance(op_1, int) and (op_1 == 0x51 or op_1 == 1)
-        if not is_op_1:
-            continue
-
-        # OP_CHECKMULTISIG should be 0xAE or int 174
-        is_op_checkmultisig = isinstance(op_checkmultisig, int) and (
-            op_checkmultisig == 0xAE or op_checkmultisig == 174
-        )
-        if not is_op_checkmultisig:
-            continue
-
-        if not isinstance(op_n, int):
-            continue
-
-        # All middle elements should be 33-byte pubkeys
-        middle = elems[1:-2]
-        pubkeys = [e for e in middle if isinstance(e, (bytes, bytearray))]
-        if len(pubkeys) != len(middle):
-            # Something else (like OP codes) in the middle; skip
-            continue
-
-        # Check that op_n matches count of pubkeys (1-of-N => N pubkeys)
-        total_keys = len(pubkeys)
-        if op_n != 0x50 + total_keys and op_n != total_keys:
-            # Accept either OP_(N) form (0x50+N) or raw smallint N
-            continue
-
-        # Last pubkey in script is the control key for this script
-        control_pk_here = pubkeys[-1]
+        data_pks, control_pk_here, _suffix_kind = parsed
 
         if not auto_detect:
             # Explicit mode: must match supplied control key
@@ -1470,8 +1719,6 @@ def cmd_txrecover(args):
         else:
             # Auto-detect mode: keep track of all candidate control keys
             detected_controls.append(control_pk_here)
-
-        data_pks = pubkeys[:-1]
         sys.stderr.write(
             f"# Input {idx}: found BPUB script with {len(data_pks)} data pubkeys\n"
         )
@@ -1790,6 +2037,31 @@ def main():
         "--feerate", required=True, type=int, help="target feerate in sats/vbyte"
     )
     tb.add_argument("--change", help="bech32 change address (optional)")
+    tb.add_argument(
+        "--legacy-scripts",
+        action="store_true",
+        help=(
+            "build legacy multisig scripts without the padding suffix "
+            "(needed to match UTXOs funded before the suffix existed)"
+        ),
+    )
+    tb.add_argument(
+        "--bpub-value",
+        type=int,
+        help=(
+            "exact value (sats) for each BPUB data output; default sizes each "
+            "output to cover its share of the reveal at --reveal-feerate "
+            "(staggered by 1 sat, never below 546)"
+        ),
+    )
+    tb.add_argument(
+        "--reveal-feerate",
+        type=int,
+        help=(
+            "feerate (sats/vbyte) to assume for the future reveal when sizing "
+            "BPUB outputs; defaults to --feerate"
+        ),
+    )
     tb.set_defaults(func=cmd_txbuild)
 
     # fundpsbt: build PSBT to fund BPUB multisig outputs (Sparrow-friendly)
@@ -1843,6 +2115,30 @@ def main():
         "--prev-spk",
         help="Hex scriptPubKey that the funding UTXO pays to",
     )
+    fp.add_argument(
+        "--legacy-scripts",
+        action="store_true",
+        help=(
+            "build legacy multisig scripts without the padding suffix"
+        ),
+    )
+    fp.add_argument(
+        "--bpub-value",
+        type=int,
+        help=(
+            "exact value (sats) for each BPUB data output; default sizes each "
+            "output to cover its share of the reveal at --reveal-feerate "
+            "(staggered by 1 sat, never below 546)"
+        ),
+    )
+    fp.add_argument(
+        "--reveal-feerate",
+        type=int,
+        help=(
+            "feerate (sats/vbyte) to assume for the future reveal when sizing "
+            "BPUB outputs; defaults to --feerate"
+        ),
+    )
     fp.set_defaults(func=cmd_fundpsbt)
 
     # revealpsbt: build PSBT to spend BPUB P2WSH outputs (reveal)
@@ -1887,6 +2183,14 @@ def main():
     )
     rp.add_argument(
         "--feerate", type=int, default=1, help="target feerate in sats/vbyte"
+    )
+    rp.add_argument(
+        "--legacy-scripts",
+        action="store_true",
+        help=(
+            "build legacy multisig scripts without the padding suffix "
+            "(must match how the UTXOs were funded)"
+        ),
     )
     rp.set_defaults(func=cmd_revealpsbt)
 

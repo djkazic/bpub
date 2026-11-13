@@ -36,7 +36,12 @@ from bitcointx.core import CTransaction
 from bitcointx.core.script import CScript
 from bitcointx.wallet import P2WPKHBitcoinAddress, P2WSHBitcoinAddress
 
-from bpub import decode_pubkeys_to_stream, decode_stream, decode_owner_redeem_script
+from bpub import (
+    decode_pubkeys_to_stream,
+    decode_stream,
+    decode_owner_redeem_script,
+    parse_bpub_multisig,
+)
 
 
 def load_config():
@@ -202,47 +207,12 @@ def try_extract_bpub_from_tx(rawtx_hex: str):
             continue
 
         redeem_script = bytes(wstack[-1])
-        try:
-            elems = list(CScript(redeem_script))
-        except Exception:
+        parsed = parse_bpub_multisig(redeem_script)
+        if parsed is None:
             continue
 
-        if len(elems) < 4:
-            continue
-
-        op_1 = elems[0]
-        op_n = elems[-2]
-        op_checkmultisig = elems[-1]
-
-        is_op_1 = isinstance(op_1, int) and (op_1 == 1 or op_1 == 0x51)
-        if not is_op_1:
-            continue
-
-        is_op_checkmultisig = isinstance(op_checkmultisig, int) and (
-            op_checkmultisig == 174 or op_checkmultisig == 0xAE
-        )
-        if not is_op_checkmultisig:
-            continue
-
-        if not isinstance(op_n, int):
-            continue
-
-        middle = elems[1:-2]
-        pubkeys = [e for e in middle if isinstance(e, (bytes, bytearray))]
-        if len(pubkeys) != len(middle):
-            continue
-
-        total_keys = len(pubkeys)
-        if total_keys < 2:
-            continue
-
-        if op_n != 0x50 + total_keys and op_n != total_keys:
-            continue
-
-        control_pk_here = pubkeys[-1]
+        data_pks, control_pk_here, _suffix_kind = parsed
         detected_controls.append(control_pk_here)
-
-        data_pks = pubkeys[:-1]
         all_data_pubkeys.extend(data_pks)
 
     if not all_data_pubkeys:

@@ -500,6 +500,7 @@ def flow_new_inscription():
         change=change_addr,
         prev_address=prev_addr,
         prev_spk=None,
+        legacy_scripts=False,
     )
 
     print("\nBuilding funding PSBT via bpub...\n")
@@ -619,6 +620,7 @@ def flow_new_inscription():
         bpub_utxo=bpub_utxos,
         change=reveal_change_addr,
         feerate=reveal_feerate,
+        legacy_scripts=False,
     )
 
     reveal_out_file = prompt_nonempty(
@@ -835,6 +837,14 @@ def flow_reveal():
         print(f"    - {u}")
     print(f"  Change addr : {change_addr}")
     print(f"  Feerate     : {feerate} sats/vbyte")
+    print(
+        "\nNOTE: this wizard always builds reveal scripts with the current (v2) "
+        "padding suffix.\n"
+        "If these UTXOs were funded BEFORE the suffix existed (legacy "
+        "scripts), the reveal\nwill not match them. In that case abort and "
+        "use the CLI instead:\n"
+        "  python3 bpub.py revealpsbt ... --legacy-scripts"
+    )
     if not prompt_yes_no("\nProceed to build reveal PSBT?", default=True):
         print("Aborted.")
         return
@@ -850,6 +860,7 @@ def flow_reveal():
         bpub_utxo=bpub_utxos,
         change=change_addr,
         feerate=feerate,
+        legacy_scripts=False,
     )
 
     out_file = prompt_nonempty(
