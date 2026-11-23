@@ -1335,5 +1335,239 @@ class ScriptExecutionTest(unittest.TestCase):
             )
 
 
+class IndexerHardeningTest(unittest.TestCase):
+    def test_decompression_bomb_rejected(self):
+        # Content exceeding MAX_CONTENT_DECOMPRESSED_BYTES must be rejected
+        # without inflating past the cap.
+        big_plain = b"\x00" * (bpub.MAX_CONTENT_DECOMPRESSED_BYTES + 4096)
+        big_deflated = bpub._raw_deflate(big_plain)
+        with self.assertRaises(ValueError):
+            bpub._raw_inflate(big_deflated)
+
+        # Metadata exceeding MAX_META_DECOMPRESSED_BYTES must be dropped cleanly.
+        big_meta = bpub._raw_deflate(b'{"filename":"' + b"a" * (bpub.MAX_META_DECOMPRESSED_BYTES + 100) + b'"}')
+        content = b"hello"
+        body = bytearray()
+        body.append(5)
+        body.append(0x02)
+        body.extend(len(content).to_bytes(8, "big"))
+        body.extend(hashlib.sha256(content).digest())
+        meta_enc = bpub._xor_obfuscate(big_meta)
+        body.extend(len(meta_enc).to_bytes(2, "big"))
+        body.extend(meta_enc)
+        body.extend(bpub._xor_obfuscate(content))
+        stream = len(body).to_bytes(4, "big") + bytes(body)
+        meta, recovered = decode_stream(stream)
+        self.assertEqual(recovered, content)
+        self.assertNotIn("filename", meta)
+
+        # Header claiming > MAX_CONTENT_DECOMPRESSED_BYTES is rejected up front.
+        fake_size = bpub.MAX_CONTENT_DECOMPRESSED_BYTES + 1
+        bad_body = (
+            bytes([5, 0x01])
+            + fake_size.to_bytes(8, "big")
+            + b"\x00" * 32
+            + (0).to_bytes(2, "big")
+            + bpub._xor_obfuscate(big_deflated)
+        )
+        with self.assertRaises(ValueError):
+            decode_stream(len(bad_body).to_bytes(4, "big") + bad_body)
+
+    def test_canonical_bpub_id_and_string_meta_types(self):
+        import json
+
+        content = b"canonical test payload"
+        forged_meta = json.dumps(
+            {
+                "bpub_id": "ff" * 32,
+                "filename": 12345,
+                "mime": ["image/png"],
+            }
+        ).encode("utf-8")
+        meta_enc = bpub._xor_obfuscate(bpub._raw_deflate(forged_meta))
+        body = (
+            bytes([5, 0x02])
+            + len(content).to_bytes(8, "big")
+            + hashlib.sha256(content).digest()
+            + len(meta_enc).to_bytes(2, "big")
+            + meta_enc
+            + bpub._xor_obfuscate(content)
+        )
+        meta, recovered = decode_stream(len(body).to_bytes(4, "big") + body)
+        self.assertEqual(recovered, content)
+        self.assertEqual(meta["bpub_id"], bpub.compute_bpub_v5_id(content))
+        self.assertNotIn("filename", meta)
+        self.assertNotIn("mime", meta)
+
+    def test_safe_stored_filenames(self):
+        import indexer
+
+        txid = "ab" * 32
+        for fname, mime in (
+            ("x.html", "text/html"),
+            ("x.svg", "image/svg+xml"),
+            ("evil.html.svg", "image/svg+xml"),
+            ("script.js", "application/javascript"),
+            ("../../../etc/passwd", "application/octet-stream"),
+            ("..", None),
+            (12345, ["bad"]),
+            ("a" * 500 + ".png", "image/png"),
+        ):
+            stored = indexer.make_stored_filename(txid, fname, mime)
+            self.assertLessEqual(len(stored), 200, stored)
+            self.assertNotIn("/", stored)
+            self.assertNotIn("..", stored)
+            ext = os.path.splitext(stored)[1].lower()
+            self.assertIn(ext, indexer.SAFE_EXTENSIONS, stored)
+            self.assertNotIn(ext, (".html", ".svg", ".js"))
+
+        self.assertTrue(
+            indexer.make_stored_filename(txid, "pic.jpg", "image/jpeg").endswith(".jpg")
+        )
+        self.assertTrue(
+            indexer.make_stored_filename(txid, "photo", "image/png").endswith(".png")
+        )
+
+    def test_ownership_chain_of_custody(self):
+        from bitcointx.core import (
+            lx,
+            COutPoint,
+            CMutableTxIn,
+            CMutableTxOut,
+            CMutableTransaction,
+        )
+        from bitcointx.core.script import CScript as BCScript, CScriptWitness
+        from bitcointx.wallet import P2WPKHBitcoinAddress, P2WSHBitcoinAddress
+        import indexer
+
+        bpub_id = bpub.compute_bpub_v5_id(b"owned-art")
+        bpub_id_hex = bpub_id.hex()
+        alice_h160 = b"\x11" * 20
+        bob_h160 = b"\x22" * 20
+        eve_h160 = b"\x33" * 20
+
+        alice_rs = bytes(bpub.build_owner_redeem_script(bpub_id, alice_h160))
+        bob_rs = bytes(bpub.build_owner_redeem_script(bpub_id, bob_h160))
+        eve_rs = bytes(bpub.build_owner_redeem_script(bpub_id, eve_h160))
+
+        alice_spk = bpub.p2wsh_scriptpubkey(BCScript(alice_rs))
+        bob_spk = bpub.p2wsh_scriptpubkey(BCScript(bob_rs))
+        eve_spk = bpub.p2wsh_scriptpubkey(BCScript(eve_rs))
+
+        alice_p2wpkh = str(
+            P2WPKHBitcoinAddress.from_scriptPubKey(BCScript(b"\x00\x14" + alice_h160))
+        )
+        bob_p2wpkh = str(
+            P2WPKHBitcoinAddress.from_scriptPubKey(BCScript(b"\x00\x14" + bob_h160))
+        )
+        bob_p2wsh = str(P2WSHBitcoinAddress.from_scriptPubKey(BCScript(bob_spk)))
+
+        def make_owner_tx(prev_txid, prev_vout, input_rs, out_spk):
+            tx = CMutableTransaction(
+                [CMutableTxIn(COutPoint(lx(prev_txid), prev_vout))],
+                [CMutableTxOut(9000, BCScript(out_spk))],
+            )
+            tx.wit.vtxinwit[0].scriptWitness = CScriptWitness(
+                [b"\x30" * 70, b"\x02" * 33, input_rs]
+            )
+            return tx.serialize(include_witness=True).hex()
+
+        ownership = {}
+        funding_txid = "10" * 32
+        bogus_txid = "99" * 32
+
+        # Unknown bpub_id cannot be pre-registered via owner spend.
+        eve_tx = make_owner_tx(bogus_txid, 0, eve_rs, eve_spk)
+        self.assertFalse(
+            indexer.apply_owner_update(
+                ownership,
+                indexer.try_extract_owner_from_tx(eve_tx),
+                "e1" * 32,
+                100,
+                "bh",
+                1,
+            )
+        )
+
+        # Register genesis reveal anchored to funding_txid.
+        self.assertTrue(
+            indexer.register_bpub_genesis(ownership, bpub_id_hex, [funding_txid])
+        )
+
+        # Eve's spend from an unrelated txid must be rejected.
+        self.assertFalse(
+            indexer.apply_owner_update(
+                ownership,
+                indexer.try_extract_owner_from_tx(eve_tx),
+                "e2" * 32,
+                101,
+                "bh",
+                2,
+            )
+        )
+
+        # Alice's genesis self-transfer from funding_txid succeeds.
+        t1_txid = "a1" * 32
+        t1_hex = make_owner_tx(funding_txid, 3, alice_rs, alice_spk)
+        self.assertTrue(
+            indexer.apply_owner_update(
+                ownership,
+                indexer.try_extract_owner_from_tx(t1_hex),
+                t1_txid,
+                102,
+                "bh",
+                3,
+            )
+        )
+        self.assertEqual(ownership[bpub_id_hex]["current_owner_p2wpkh"], alice_p2wpkh)
+        self.assertEqual(ownership[bpub_id_hex]["current_outpoint"], f"{t1_txid}:0")
+
+        # Eve still cannot hijack after genesis by spending a different outpoint.
+        self.assertFalse(
+            indexer.apply_owner_update(
+                ownership,
+                indexer.try_extract_owner_from_tx(eve_tx),
+                "e3" * 32,
+                103,
+                "bh",
+                4,
+            )
+        )
+
+        # Alice transfers to Bob (T1:0 -> Bob's P2WSH): current_owner_p2wpkh
+        # clears (no longer Alice) and tracks Bob's P2WSH + outpoint T2:0.
+        t2_txid = "b2" * 32
+        t2_hex = make_owner_tx(t1_txid, 0, alice_rs, bob_spk)
+        self.assertTrue(
+            indexer.apply_owner_update(
+                ownership,
+                indexer.try_extract_owner_from_tx(t2_hex),
+                t2_txid,
+                104,
+                "bh",
+                5,
+            )
+        )
+        self.assertIsNone(ownership[bpub_id_hex]["current_owner_p2wpkh"])
+        self.assertEqual(ownership[bpub_id_hex]["current_owner_p2wsh"], bob_p2wsh)
+        self.assertEqual(ownership[bpub_id_hex]["current_outpoint"], f"{t2_txid}:0")
+
+        # Bob self-transfers T2:0 -> T3:0, revealing Bob's P2WPKH as current owner.
+        t3_txid = "b3" * 32
+        t3_hex = make_owner_tx(t2_txid, 0, bob_rs, bob_spk)
+        self.assertTrue(
+            indexer.apply_owner_update(
+                ownership,
+                indexer.try_extract_owner_from_tx(t3_hex),
+                t3_txid,
+                105,
+                "bh",
+                6,
+            )
+        )
+        self.assertEqual(ownership[bpub_id_hex]["current_owner_p2wpkh"], bob_p2wpkh)
+        self.assertEqual(ownership[bpub_id_hex]["current_outpoint"], f"{t3_txid}:0")
+
+
 if __name__ == "__main__":
     unittest.main()

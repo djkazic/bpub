@@ -278,14 +278,32 @@ def _xor_obfuscate(data: bytes) -> bytes:
     return bytes(b ^ salt[i % slen] for i, b in enumerate(data))
 
 
+# Upper bounds on decompressed BPUB streams to prevent zip-bomb OOM/disk DoS.
+MAX_META_DECOMPRESSED_BYTES = 64 * 1024
+MAX_CONTENT_DECOMPRESSED_BYTES = 16 * 1024 * 1024
+
+
 def _raw_deflate(data: bytes) -> bytes:
     """Raw DEFLATE (no zlib/gzip header) for low-fingerprint compression."""
     return zlib.compress(data, 9, wbits=-15)
 
 
-def _raw_inflate(data: bytes) -> bytes:
-    """Inverse of _raw_deflate."""
-    return zlib.decompress(data, wbits=-15)
+def _raw_inflate(
+    data: bytes, max_bytes: int = MAX_CONTENT_DECOMPRESSED_BYTES
+) -> bytes:
+    """Inverse of _raw_deflate with a hard upper bound on output size."""
+    decomp = zlib.decompressobj(wbits=-15)
+    out = decomp.decompress(data, max_bytes + 1)
+    if len(out) > max_bytes or decomp.unconsumed_tail:
+        raise ValueError(
+            f"Decompressed data exceeds maximum allowed size ({max_bytes} bytes)"
+        )
+    tail = decomp.flush(max_bytes - len(out) + 1)
+    if len(out) + len(tail) > max_bytes or not decomp.eof:
+        raise ValueError(
+            f"Decompressed data exceeds maximum allowed size ({max_bytes} bytes)"
+        )
+    return out + tail
 
 
 def compute_bpub_v5_id(data: bytes) -> bytes:
@@ -483,17 +501,25 @@ def decode_stream(payload: bytes):
     """
     # Legacy BPUB v3.5 with "BPUB" magic + TLV header
     if payload.startswith(b"BPUB"):
+        if len(payload) < 8:
+            raise ValueError("Truncated BPUB v3.5 header")
         version = payload[4]
         if version != 1:
             raise ValueError(f"Unsupported BPUB version: {version}")
 
         header_len = int.from_bytes(payload[5:8], "big")
+        if 8 + header_len > len(payload):
+            raise ValueError("Truncated BPUB v3.5 TLV header")
         header = payload[8 : 8 + header_len]
 
         meta = {"bpub_version": 1}
         i = 0
         while i < len(header):
+            if i + 2 > len(header):
+                raise ValueError("Truncated BPUB v3.5 TLV entry")
             t, l = header[i], header[i + 1]
+            if i + 2 + l > len(header):
+                raise ValueError("Truncated BPUB v3.5 TLV value")
             val = header[i + 2 : i + 2 + l]
             if t == 0xFF:
                 break
@@ -509,8 +535,14 @@ def decode_stream(payload: bytes):
 
         if "size" not in meta or "sha" not in meta:
             raise ValueError("Missing mandatory metadata (size/sha) in BPUB header")
+        if meta["size"] > MAX_CONTENT_DECOMPRESSED_BYTES:
+            raise ValueError(
+                f"BPUB v3.5 size exceeds limit ({meta['size']} > {MAX_CONTENT_DECOMPRESSED_BYTES})"
+            )
 
         start = 8 + header_len
+        if start + meta["size"] > len(payload):
+            raise ValueError("Truncated BPUB v3.5 content")
         content = payload[start : start + meta["size"]]
 
         if hashlib.sha256(content).digest() != meta["sha"]:
@@ -542,6 +574,11 @@ def decode_stream(payload: bytes):
 
     flags = body[1]
     size_uncompressed = int.from_bytes(body[2:10], "big")
+    if size_uncompressed > MAX_CONTENT_DECOMPRESSED_BYTES:
+        raise ValueError(
+            f"BPUB v{version} uncompressed size exceeds limit "
+            f"({size_uncompressed} > {MAX_CONTENT_DECOMPRESSED_BYTES})"
+        )
     sha_uncompressed = body[10:42]
     meta_len = int.from_bytes(body[42:44], "big")
 
@@ -561,25 +598,23 @@ def decode_stream(payload: bytes):
     if meta_len:
         try:
             meta_deflated = _xor_obfuscate(meta_blob_enc)
-            meta_bytes = _raw_inflate(meta_deflated)
+            meta_bytes = _raw_inflate(
+                meta_deflated, max_bytes=MAX_META_DECOMPRESSED_BYTES
+            )
             meta_json = json.loads(meta_bytes.decode("utf-8"))
             if isinstance(meta_json, dict):
-                if "mime" in meta_json:
+                if isinstance(meta_json.get("mime"), str):
                     meta["mime"] = meta_json["mime"]
-                if "filename" in meta_json:
+                if isinstance(meta_json.get("filename"), str):
                     meta["filename"] = meta_json["filename"]
-                if "bpub_id" in meta_json:
-                    try:
-                        meta["bpub_id"] = bytes.fromhex(meta_json["bpub_id"])
-                    except Exception:
-                        # if it doesn't parse, leave as-is in hex form
-                        meta["bpub_id"] = meta_json["bpub_id"]
         except Exception:
             meta["meta_blob"] = meta_blob_enc
 
     content_plain = _xor_obfuscate(content_enc)
     if flags & 0x01:
-        content = _raw_inflate(content_plain)
+        content = _raw_inflate(
+            content_plain, max_bytes=MAX_CONTENT_DECOMPRESSED_BYTES
+        )
     else:
         content = content_plain
 
@@ -590,7 +625,9 @@ def decode_stream(payload: bytes):
     if hashlib.sha256(content).digest() != sha_uncompressed:
         raise ValueError("SHA-256 mismatch in v4/v5 content")
 
-    if version == 5 and "bpub_id" not in meta:
+    # Always derive canonical bpub_id from verified content (never trust
+    # unauthenticated JSON metadata).
+    if version == 5:
         meta["bpub_id"] = compute_bpub_v5_id(content)
 
     return meta, content

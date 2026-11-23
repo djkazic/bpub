@@ -139,21 +139,38 @@
 
         statusEl.textContent = `Showing ${items.length} item${items.length === 1 ? '' : 's'}.`;
 
+        const SAFE_IMG_EXTS = ['.jpg', '.jpeg', '.png', '.gif', '.webp'];
         const grid = document.getElementById('grid');
         items.forEach(item => {
-          if (!item.stored_filename) return;
+          if (typeof item.stored_filename !== 'string' || !item.stored_filename) return;
+          if (item.stored_filename.includes('/') || item.stored_filename.includes('\\') || item.stored_filename.includes('..')) {
+            return;
+          }
 
           const card = document.createElement('div');
           card.className = 'card';
 
-          const img = document.createElement('img');
-          img.src = 'media/' + item.stored_filename;
-          img.alt = item.filename || item.txid;
+          const mediaUrl = 'media/' + encodeURIComponent(item.stored_filename);
+          const lowerName = item.stored_filename.toLowerCase();
+          const isSafeImage = SAFE_IMG_EXTS.some(ext => lowerName.endsWith(ext));
 
           const link = document.createElement('a');
-          link.href = 'media/' + item.stored_filename;
+          link.href = mediaUrl;
           link.target = '_blank';
-          link.appendChild(img);
+          link.rel = 'noopener noreferrer';
+
+          if (isSafeImage) {
+            const img = document.createElement('img');
+            img.src = mediaUrl;
+            img.alt = item.filename || item.txid;
+            link.appendChild(img);
+          } else {
+            link.download = item.stored_filename;
+            const placeholder = document.createElement('div');
+            placeholder.style.cssText = 'height:220px;display:flex;align-items:center;justify-content:center;background:#000;color:#888;font-size:0.85rem;';
+            placeholder.textContent = 'Download file';
+            link.appendChild(placeholder);
+          }
 
           const meta = document.createElement('div');
           meta.className = 'meta';
@@ -177,9 +194,13 @@
           meta.appendChild(info);
           meta.appendChild(tx);
 
-          if (item.bpub_id && ownership && ownership[item.bpub_id]) {
+          if (
+            typeof item.bpub_id === 'string' &&
+            ownership &&
+            Object.prototype.hasOwnProperty.call(ownership, item.bpub_id)
+          ) {
             const ownerRecord = ownership[item.bpub_id];
-            const ownerAddr = ownerRecord.current_owner_p2wpkh || ownerRecord.current_owner_p2wsh;
+            const ownerAddr = ownerRecord && (ownerRecord.current_owner_p2wpkh || ownerRecord.current_owner_p2wsh);
             if (ownerAddr) {
               const ownerDiv = document.createElement('div');
               ownerDiv.className = 'owner';
