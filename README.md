@@ -32,38 +32,39 @@ $ python3 bpub.py fundpsbt monkey.jpg \
 
 # create the reveal PSBT
 # NOTE: each --bpub-utxo VALUE must be that output's real value in the
-# funding tx. Data outputs are sized for the reveal fee and staggered by
-# 1 sat, so they are NOT all 546; a wrong value yields an invalid signature.
+# funding tx. Data outputs are sized for the reveal fee (floored at 547
+# sats, larger for smaller files or higher feerates), so they are NOT
+# 546; a wrong value yields an invalid signature.
 $ python3 bpub.py revealpsbt monkey.jpg \
   --mime image/jpeg \
   --filename monkey.jpg \
   --control-pubkey CONTROL_PUBKEY \
-  --bpub-utxo <funding_txid>:0:546 \
+  --bpub-utxo <funding_txid>:0:547 \
   --bpub-utxo <funding_txid>:1:547 \
-  --bpub-utxo <funding_txid>:2:548 \
-  --bpub-utxo <funding_txid>:3:549 \
-  --bpub-utxo <funding_txid>:4:550 \
-  --bpub-utxo <funding_txid>:5:551 \
-  --bpub-utxo <funding_txid>:6:552 \
-  --bpub-utxo <funding_txid>:7:553 \
-  --bpub-utxo <funding_txid>:8:554 \
-  --bpub-utxo <funding_txid>:9:555 \
-  --bpub-utxo <funding_txid>:10:556 \
-  --bpub-utxo <funding_txid>:11:557 \
-  --bpub-utxo <funding_txid>:12:558 \
-  --bpub-utxo <funding_txid>:13:559 \
-  --bpub-utxo <funding_txid>:14:560 \
-  --bpub-utxo <funding_txid>:15:561 \
-  --bpub-utxo <funding_txid>:16:562 \
-  --bpub-utxo <funding_txid>:17:563 \
-  --bpub-utxo <funding_txid>:18:564 \
-  --bpub-utxo <funding_txid>:19:565 \
-  --bpub-utxo <funding_txid>:20:566 \
-  --bpub-utxo <funding_txid>:21:567 \
-  --bpub-utxo <funding_txid>:22:568 \
-  --bpub-utxo <funding_txid>:23:569 \
-  --bpub-utxo <funding_txid>:24:570 \
-  --bpub-utxo <funding_txid>:25:571 \
+  --bpub-utxo <funding_txid>:2:547 \
+  --bpub-utxo <funding_txid>:3:547 \
+  --bpub-utxo <funding_txid>:4:547 \
+  --bpub-utxo <funding_txid>:5:547 \
+  --bpub-utxo <funding_txid>:6:547 \
+  --bpub-utxo <funding_txid>:7:547 \
+  --bpub-utxo <funding_txid>:8:547 \
+  --bpub-utxo <funding_txid>:9:547 \
+  --bpub-utxo <funding_txid>:10:547 \
+  --bpub-utxo <funding_txid>:11:547 \
+  --bpub-utxo <funding_txid>:12:547 \
+  --bpub-utxo <funding_txid>:13:547 \
+  --bpub-utxo <funding_txid>:14:547 \
+  --bpub-utxo <funding_txid>:15:547 \
+  --bpub-utxo <funding_txid>:16:547 \
+  --bpub-utxo <funding_txid>:17:547 \
+  --bpub-utxo <funding_txid>:18:547 \
+  --bpub-utxo <funding_txid>:19:547 \
+  --bpub-utxo <funding_txid>:20:547 \
+  --bpub-utxo <funding_txid>:21:547 \
+  --bpub-utxo <funding_txid>:22:547 \
+  --bpub-utxo <funding_txid>:23:547 \
+  --bpub-utxo <funding_txid>:24:547 \
+  --bpub-utxo <funding_txid>:25:547 \
   --change bc1q... --feerate 1 > reveal.psbt
 
 # sign the reveal PSBT

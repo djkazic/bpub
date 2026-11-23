@@ -295,11 +295,15 @@ def bpub_bytes(tx_witness_stacks):
     return total
 
 
-def unproven_pubkey_bytes(script, witness_stack, max_unproven=MAX_UNPROVEN_PUBKEYS_OLD):
-    """Model of the key-accounting rule, scoped to what P2WSH multisig
-    scripts contain."""
+def unproven_pubkey_bytes(
+    script, witness_stack, max_unproven=MAX_UNPROVEN_PUBKEYS_OLD, verified_keys=None
+):
+    """Model of the key-accounting rule (including Knots v29.5.1 PR #470
+    verified-key recounting), scoped to what P2WSH multisig scripts contain."""
     pubkeys = 0
     provable = 0
+    unverified_bytes = 0
+    push_run_unverified_bytes = 0
     run_keys = 0
     push_run_keys = 0
     run_opened_by = -1
@@ -348,6 +352,7 @@ def unproven_pubkey_bytes(script, witness_stack, max_unproven=MAX_UNPROVEN_PUBKE
             segwit_multisig and len(push) == 65
         )
         count = multisig_count(opcode, push)
+        is_verified = verified_keys is not None and is_pubkey and push in verified_keys
 
         if inside_noop:
             if opcode in (OP_IF, OP_NOTIF):
@@ -362,8 +367,12 @@ def unproven_pubkey_bytes(script, witness_stack, max_unproven=MAX_UNPROVEN_PUBKE
             run_keys += 1
             push_run_keys += 1
             pubkeys += 1
+            if not is_verified:
+                push_run_unverified_bytes += len(push)
+                unverified_bytes += len(push)
         elif opcode in (OP_DROP, OP_2DROP) and last_is_push:
             pubkeys -= push_run_keys
+            unverified_bytes -= push_run_unverified_bytes
             run_keys = 0
         elif opcode in (OP_CHECKSIG, OP_CHECKSIGVERIFY):
             provable += 1
@@ -378,6 +387,7 @@ def unproven_pubkey_bytes(script, witness_stack, max_unproven=MAX_UNPROVEN_PUBKE
         is_push = is_run_push(opcode)
         if not is_push:
             push_run_keys = 0
+            push_run_unverified_bytes = 0
 
         # odd-push accounting: only where the script runs
         # OP_CHECKMULTISIG, and never inside an OP_FALSE OP_IF envelope.
@@ -419,9 +429,19 @@ def unproven_pubkey_bytes(script, witness_stack, max_unproven=MAX_UNPROVEN_PUBKE
             odd_run, odd_last, odd_last_is_digest, OP_INVALIDOPCODE
         )
 
-    if pubkeys < provable + max_unproven:
-        return odd_bytes
-    return (pubkeys - provable - max_unproven) * COMPRESSED_PUBKEY_SIZE + odd_bytes
+    static_charge = (
+        0
+        if pubkeys < provable + max_unproven
+        else (pubkeys - provable - max_unproven) * COMPRESSED_PUBKEY_SIZE
+    ) + odd_bytes
+    if verified_keys is None:
+        return static_charge
+
+    allowance = max_unproven * COMPRESSED_PUBKEY_SIZE
+    verified_charge = (
+        0 if unverified_bytes < allowance else unverified_bytes - allowance
+    ) + odd_bytes
+    return max(static_charge, verified_charge)
 
 
 def pushrun_payload_bytes(script):
@@ -504,25 +524,21 @@ SIG_STANDIN = b"\x30" + b"\x01" * 71  # 72 bytes, signature-sized
 
 
 def make_scripts(data, version):
-    """version: 0 = legacy (no suffix), 1 = v1 padding suffix, 2 = v2 suffix."""
+    """version: 0 = legacy 1-of-15 (no suffix), 1 = padv1, 2 = padv2, 3 = padv3 (1-of-11)."""
     stream = build_stream_v5(data, "application/octet-stream", "test.bin")
     data_pubkeys = encode_stream_to_pubkeys(stream)
     # A 33-byte stand-in control pubkey; parsing/encoding tests never verify it.
     control_pubkey = b"\x02" + b"\x11" * 32
-    chunks = list(chunk_data_pubkeys(data_pubkeys))
-    scripts = []
-    for c in chunks:
-        rs = bytes(
-            build_multisig_script(c, control_pubkey, pad_suffix=version > 0)
-        )
-        if version == 1:
-            # v1 is no longer buildable via the public API; construct it
-            # directly to keep parser/signer coverage.
-            base = bytes(
-                build_multisig_script(c, control_pubkey, pad_suffix=False)
-            )
-            rs = base + bpub._serialize_elems(bpub._pad_suffix_elems(1))
-        scripts.append(rs)
+    max_pk = (
+        bpub.MAX_PUBKEYS_PER_SCRIPT
+        if version == 3
+        else bpub.MAX_PUBKEYS_PER_SCRIPT_LEGACY
+    )
+    chunks = list(chunk_data_pubkeys(data_pubkeys, max_pubkeys=max_pk))
+    scripts = [
+        bytes(build_multisig_script(c, control_pubkey, pad_suffix=version))
+        for c in chunks
+    ]
     return data_pubkeys, chunks, scripts
 
 
@@ -640,13 +656,52 @@ class RelayModelTest(unittest.TestCase):
         stacks = [[b"", SIG_STANDIN, rs] for rs in scripts]
         self.assertEqual(bpub_bytes(stacks), sum(len(s) for s in scripts))
 
+    def test_padv3_free_under_verified_key_recount(self):
+        # padv3 (1-of-11 + OP_1 OP_EQUAL, no padding witness items) passes both
+        # static accounting and Knots v29.5.1 verified-key recounting (PR #470)
+        # with 0 bytes charged, and skips BPUBBytes and push-drop checks.
+        control = b"\x02" + b"\x11" * 32
+        _, _, scripts = make_scripts(os.urandom(1000), 3)
+        stacks = [[b"", SIG_STANDIN, rs] for rs in scripts]
+        for rs, stack in zip(scripts, stacks):
+            self.assertEqual(
+                unproven_pubkey_bytes(rs, stack, MAX_UNPROVEN_PUBKEYS_NEW), 0
+            )
+            self.assertEqual(
+                unproven_pubkey_bytes(
+                    rs, stack, MAX_UNPROVEN_PUBKEYS_NEW, verified_keys={control}
+                ),
+                0,
+            )
+            self.assertEqual(pushrun_payload_bytes(rs), 0)
+        self.assertEqual(bpub_bytes(stacks), 0)
+
+    def test_padv2_charged_under_verified_key_recount(self):
+        # Under Knots v29.5.1 (PR #470), padv2's 13 unexecuted OP_CHECKSIGs no
+        # longer credit decoy keys: 14 unverified keys * 33 - 10 * 33 = 132 B.
+        control = b"\x02" + b"\x11" * 32
+        _, _, scripts = make_scripts(os.urandom(500), 2)
+        rs = scripts[0]
+        stack = make_pad_items(rs) + [b"", SIG_STANDIN, rs]
+        self.assertEqual(
+            unproven_pubkey_bytes(rs, stack, MAX_UNPROVEN_PUBKEYS_NEW), 0
+        )
+        self.assertEqual(
+            unproven_pubkey_bytes(
+                rs, stack, MAX_UNPROVEN_PUBKEYS_NEW, verified_keys={control}
+            ),
+            132,
+        )
+
     def test_suffixed_scripts_skipped(self):
-        # The padding suffixes mean the script does not end at
-        # OP_CHECKMULTISIG, so the stream-recognition rule skips it entirely.
-        for version in (1, 2):
+        # The suffixes mean the script does not end at OP_CHECKMULTISIG, so
+        # the stream-recognition rule skips them entirely.
+        for version in (1, 2, 3):
             _, _, scripts = make_scripts(os.urandom(1000), version)
             stacks = [
-                make_pad_items(rs) + [b"", SIG_STANDIN, rs] for rs in scripts
+                (make_pad_items(rs) if version in (1, 2) else [])
+                + [b"", SIG_STANDIN, rs]
+                for rs in scripts
             ]
             self.assertEqual(bpub_bytes(stacks), 0, f"v{version}")
 
@@ -731,7 +786,7 @@ class PadItemTest(unittest.TestCase):
 class ParseTest(unittest.TestCase):
     def test_roundtrip_all_variants(self):
         data = os.urandom(1000)
-        for version, kind in ((0, "none"), (1, "padv1"), (2, "padv2")):
+        for version, kind in ((0, "none"), (1, "padv1"), (2, "padv2"), (3, "padv3")):
             data_pubkeys, chunks, scripts = make_scripts(data, version)
             recovered = []
             for rs, chunk in zip(scripts, chunks):
@@ -746,52 +801,65 @@ class ParseTest(unittest.TestCase):
             self.assertEqual(meta["size"], len(data))
 
     def test_unknown_suffix_lenient(self):
-        _, _, scripts = make_scripts(os.urandom(500), 2)
-        rs = scripts[0] + b"\x61"  # OP_NOP trailing
-        parsed = parse_bpub_multisig(rs)
-        self.assertIsNotNone(parsed)
-        self.assertEqual(parsed[2], "unknown")
-        self.assertEqual(len(parsed[0]), 14)
+        for version, expected_keys in ((2, 14), (3, 10)):
+            _, _, scripts = make_scripts(os.urandom(500), version)
+            rs = scripts[0] + b"\x61"  # OP_NOP trailing
+            parsed = parse_bpub_multisig(rs)
+            self.assertIsNotNone(parsed)
+            self.assertEqual(parsed[2], "unknown")
+            self.assertEqual(len(parsed[0]), expected_keys)
 
     def test_rejects_non_bpub(self):
         self.assertIsNone(parse_bpub_multisig(b""))
         self.assertIsNone(parse_bpub_multisig(b"\x51\x21" + b"\x02" * 33))
+        # op_n > OP_16 (e.g. 17 pushes + OP_NOP 0x61 + OP_CHECKMULTISIG) must not match.
+        bogus = bytes([0x51]) + (bytes([0x21]) + b"\x02" * 33) * 17 + bytes([0x61, 0xAE])
+        self.assertIsNone(parse_bpub_multisig(bogus))
 
 
 class FundingEconomicsTest(unittest.TestCase):
-    def test_values_floor_and_distinct(self):
+    def test_values_above_dust_and_linear(self):
         for feerate in (1, 2, 5, 20):
-            for n in (1, 2, 7, 26):
+            for n in (1, 2, 7, 26, 250):
                 values = bpub_output_values(n, feerate)
                 self.assertEqual(len(values), n)
-                self.assertTrue(all(v >= BPUB_DUST for v in values))
-                # no three outputs share one value (staggered by 1 sat)
-                self.assertEqual(len(set(values)), n)
+                # Every output sits strictly above BPUB_DUST (546), so zero
+                # outputs share a value <= 546.
+                self.assertTrue(all(v > BPUB_DUST for v in values))
+                # Sub-quadratic (linear O(n)) upfront capital: uniform values
+                # with at most 1 sat/output over the dust floor (or 0 over the
+                # reveal-share sizing).
+                self.assertEqual(len(set(values)), 1)
+                fixed_share = (
+                    (bpub.REVEAL_BASE_VBYTES + 34) * feerate + BPUB_DUST + n - 1
+                ) // n
+                share = REVEAL_INPUT_VBYTES * feerate + fixed_share
+                self.assertLessEqual(sum(values) - n * max(BPUB_DUST, share), n)
 
     def test_sized_outputs_cover_reveal(self):
-        # Whenever sizing lifts values above the dust floor, a reveal at the
-        # funding feerate must leave a non-dust change output.
+        # A reveal at the funding feerate must always leave a non-dust change
+        # output.
         for feerate in (1, 2, 5, 20):
-            for n in (1, 2, 7, 26, 50):
+            for n in (1, 2, 7, 26, 50, 250):
                 values = bpub_output_values(n, feerate)
                 fee = estimate_fee_reveal(n, 1, feerate, pad_suffix=True)
                 change = sum(values) - fee
-                if max(values) > BPUB_DUST:
-                    self.assertGreaterEqual(
-                        change,
-                        BPUB_DUST,
-                        f"feerate={feerate} n={n} change={change}",
-                    )
+                self.assertGreaterEqual(
+                    change,
+                    BPUB_DUST,
+                    f"feerate={feerate} n={n} change={change}",
+                )
 
     def test_546_floor_case(self):
-        # At 1 sat/vB the dust floor binds only for larger reveals; small
-        # ones are sized above it (fixed overhead + change dust dominate).
+        # At 1 sat/vB with padv3 (175 vB/input), only n=1 is sized above the
+        # 547-sat floor (855 sats); every multi-output reveal (n >= 2) sits
+        # directly on the 547-sat floor.
         for n in range(1, 9):
             values = bpub_output_values(n, 1)
-            if n < 8:
-                self.assertGreater(min(values), BPUB_DUST, f"n={n}")
+            if n == 1:
+                self.assertGreater(min(values), BPUB_DUST + 1, f"n={n}")
             else:
-                self.assertEqual(min(values), BPUB_DUST, f"n={n}")
+                self.assertEqual(min(values), BPUB_DUST + 1, f"n={n}")
             change = sum(values) - estimate_fee_reveal(n, 1, 1)
             self.assertGreaterEqual(change, BPUB_DUST, f"n={n} change={change}")
 
@@ -799,30 +867,31 @@ class FundingEconomicsTest(unittest.TestCase):
         self.assertEqual(bpub_output_values(5, 1, bpub_value=1000), [1000] * 5)
 
     def test_reveal_feerate_budget_staggered(self):
+        # Current bpub_output_values() is uniform (O(n)); reserved == ceiling.
         for feerate in (1, 2, 5, 20):
             for n in (1, 2, 8, 50, 250):
                 values = bpub_output_values(n, feerate)
                 reserved, ceiling = reveal_feerate_budget(values, pad_suffix=True)
                 self.assertGreaterEqual(reserved, feerate)
-                self.assertGreaterEqual(ceiling, reserved)
-                # Input order must not affect detection of the 1-sat stagger.
-                self.assertEqual(
-                    reveal_feerate_budget(list(reversed(values)), pad_suffix=True),
-                    (reserved, ceiling),
-                )
-        # At n=1000, 1 sat/vB, the 1-sat stagger adds enough sats to raise the
+                self.assertEqual(ceiling, reserved)
+
+        # Earlier 1-sat-staggered fundings remain supported regardless of input
+        # order: at n=400, 1 sat/vB, the stagger adds enough sats to raise the
         # dust ceiling above the reserved feerate.
-        reserved, ceiling = reveal_feerate_budget(
-            bpub_output_values(1000, 1), pad_suffix=True
+        legacy_staggered = [BPUB_DUST + i for i in range(400)]
+        reserved, ceiling = reveal_feerate_budget(legacy_staggered, pad_suffix=True)
+        self.assertGreater(ceiling, reserved)
+        self.assertEqual(
+            reveal_feerate_budget(list(reversed(legacy_staggered)), pad_suffix=True),
+            (reserved, ceiling),
         )
-        self.assertEqual(reserved, 1)
-        self.assertEqual(ceiling, 2)
 
     def test_reveal_feerate_budget_unstaggered(self):
-        # Uniform --bpub-value 546 (no stagger): 250 padded inputs easily cover
-        # 1 sat/vB with 23,866 sats of change; must not subtract phantom stagger.
+        # Uniform --bpub-value 546 (no stagger): 250 padv3 inputs (175 vB each)
+        # cover 3 sat/vB (total_in=136500, total_vb=43884); must not subtract
+        # phantom stagger.
         reserved, ceiling = reveal_feerate_budget([BPUB_DUST] * 250, pad_suffix=True)
-        self.assertEqual((reserved, ceiling), (1, 1))
+        self.assertEqual((reserved, ceiling), (3, 3))
 
         # Uniform legacy 546-sat outputs (no stagger): 400 legacy inputs cover
         # 2 sat/vB (previously under-reported as 1 sat/vB).
@@ -831,7 +900,7 @@ class FundingEconomicsTest(unittest.TestCase):
 
         # Arbitrary custom values (non-staggered) use their real total.
         reserved, ceiling = reveal_feerate_budget([BPUB_DUST, 50000], pad_suffix=True)
-        self.assertEqual((reserved, ceiling), (48, 48))
+        self.assertEqual((reserved, ceiling), (103, 103))
 
     @unittest.skipUnless(SECP256K1, SECP_SKIP)
     def test_revealpsbt_no_spurious_warning_for_unstaggered_utxos(self):
@@ -841,12 +910,12 @@ class FundingEconomicsTest(unittest.TestCase):
 
         from bitcointx.wallet import P2WPKHBitcoinAddress
 
-        # 250 uniform 546-sat padded UTXOs at 1 sat/vB leave ~23,866 sats of
-        # change and must neither report 0 sat/vB nor emit a margin warning.
-        payload = b"\x42" * 108_000
+        # ~250 uniform 546-sat padv3 UTXOs at 1 sat/vB leave ample change and
+        # must neither under-report nor emit a margin warning.
+        payload = b"\x42" * 77_000
         stream = build_stream_v5(payload, "application/octet-stream", "big.bin")
         n_chunks = len(list(chunk_data_pubkeys(encode_stream_to_pubkeys(stream))))
-        self.assertEqual(n_chunks, 250)
+        self.assertGreaterEqual(n_chunks, 245)
 
         control_pubkey = "02" + "11" * 32
         change_addr = str(
@@ -877,7 +946,7 @@ class FundingEconomicsTest(unittest.TestCase):
 
         self.assertTrue(out_buf.getvalue().strip())
         err = err_buf.getvalue()
-        self.assertIn("reserve ~1 sat/vB", err)
+        self.assertIn("reserve ~3 sat/vB", err)
         self.assertNotIn("WARNING: requested feerate exceeds", err)
 
 
@@ -888,42 +957,46 @@ class WizardNamespaceTest(unittest.TestCase):
         # new argparse attributes (getattr defaults).
         import contextlib
         import io
+        import tempfile
 
         from bitcointx.core.key import CKey
         from bitcointx.wallet import P2WPKHBitcoinAddress
 
-        with open("/dev/urandom", "rb") as f:
-            payload = f.read(500)
-        with open("/tmp/bpub_wizard_test.bin", "wb") as f:
-            f.write(payload)
+        payload = os.urandom(400)
         key = CKey.from_secret_bytes(CONTROL_SECRET)
         change = CKey.from_secret_bytes(hashlib.sha256(b"change").digest())
         change_addr = str(P2WPKHBitcoinAddress.from_pubkey(change.pub))
         fake = "aa" * 32
-        args = SimpleNamespace(
-            file="/tmp/bpub_wizard_test.bin",
-            mime="application/octet-stream",
-            filename="",
-            compress=False,
-            legacy_v3=False,
-            v4=False,
-            control_pubkey=bytes(key.pub).hex(),
-            bpub_utxo=[f"{fake}:0:2000", f"{fake}:1:2000"],
-            change=change_addr,
-            feerate=1,
-        )
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            bpub.cmd_revealpsbt(args)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "wizard_test.bin")
+            with open(path, "wb") as f:
+                f.write(payload)
+            args = SimpleNamespace(
+                file=path,
+                mime="application/octet-stream",
+                filename="",
+                compress=False,
+                legacy_v3=False,
+                v4=False,
+                control_pubkey=bytes(key.pub).hex(),
+                bpub_utxo=[f"{fake}:0:2000", f"{fake}:1:2000"],
+                change=change_addr,
+                feerate=1,
+            )
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(
+                io.StringIO()
+            ):
+                bpub.cmd_revealpsbt(args)
         self.assertTrue(buf.getvalue().strip())
 
 
 class WizardRevealValuesTest(unittest.TestCase):
     """
     The wizard must feed revealpsbt the real funded value of every BPUB
-    data output. Funding outputs are sized and staggered, so assuming
-    546 sats either trips the change-is-dust check or (worse) produces
-    BIP143 signatures committing to the wrong amount.
+    data output. Funding outputs are sized for the reveal fee (floored at
+    547 sats), so assuming 546 sats either trips the change-is-dust check
+    or (worse) produces BIP143 signatures committing to the wrong amount.
     """
 
     FUND_TXID = "bb" * 32
@@ -1044,9 +1117,12 @@ class WizardRevealValuesTest(unittest.TestCase):
 
         from bitcointx.core.scripteval import VerifyScriptError
 
-        # (payload size, expected data outputs): n=2 is sized above the
-        # dust floor; n=8 sits on the floor and differs only by the stagger.
-        for size, n in ((300, 2), (3000, 8)):
+        # (payload size, expected data outputs): n=1 is sized above the
+        # 547-sat floor (855 sats); n=8 sits on the 547-sat floor (still != 546).
+        for size, n, expected_err in (
+            (100, 1, SystemExit),
+            (2200, 8, VerifyScriptError),
+        ):
             with self.subTest(n=n), tempfile.TemporaryDirectory() as tmp:
                 key, common, fund_tx = self._fund(tmp, size)
                 self.assertEqual(len(fund_tx.vout), n + 2)
@@ -1066,7 +1142,7 @@ class WizardRevealValuesTest(unittest.TestCase):
 
                 # The old behaviour (546 for every output) must not verify.
                 assumed = [f"{self.FUND_TXID}:{i}:{BPUB_DUST}" for i in range(n)]
-                with self.assertRaises((SystemExit, VerifyScriptError)):
+                with self.assertRaises(expected_err):
                     self._reveal_and_verify(key, common, fund_tx, assumed)
 
     @unittest.skipUnless(wizard is not None, WIZARD_SKIP)
@@ -1150,28 +1226,39 @@ class ScriptExecutionTest(unittest.TestCase):
             SCRIPT_VERIFY_WITNESS_PUBKEYTYPE,
         }
 
+        import contextlib
+        import io
+        from bitcointx.core.psbt import PartiallySignedTransaction as PSBT
+        from bitcointx.core import CTxOut
+        from bitcointx.wallet import CBitcoinSecret
+        import indexer
+
         key = CKey.from_secret_bytes(CONTROL_SECRET)
         control_pubkey = bytes(key.pub)
+        wif = str(CBitcoinSecret.from_secret_bytes(key.secret_bytes))
 
-        for version in (0, 1, 2):
+        for version, expected_kind in (
+            (0, "none"),
+            (1, "padv1"),
+            (2, "padv2"),
+            (3, "padv3"),
+        ):
             data = os.urandom(600)
             stream = build_stream_v5(data, "application/octet-stream", "t.bin")
             data_pubkeys = encode_stream_to_pubkeys(stream)
-            chunks = list(chunk_data_pubkeys(data_pubkeys))
+            max_pk = (
+                bpub.MAX_PUBKEYS_PER_SCRIPT
+                if version == 3
+                else bpub.MAX_PUBKEYS_PER_SCRIPT_LEGACY
+            )
+            chunks = list(chunk_data_pubkeys(data_pubkeys, max_pubkeys=max_pk))
             self.assertGreaterEqual(len(chunks), 2)
-            scripts = []
-            for c in chunks:
-                rs = build_multisig_script(
-                    c, control_pubkey, pad_suffix=version == 2
-                )
-                if version == 1:
-                    rs = BCScript(
-                        bytes(rs)
-                        + bpub._serialize_elems(bpub._pad_suffix_elems(1))
-                    )
-                scripts.append(rs)
+            scripts = [
+                build_multisig_script(c, control_pubkey, pad_suffix=version)
+                for c in chunks
+            ]
             spks = [bpub.p2wsh_scriptpubkey(rs) for rs in scripts]
-            values = [BPUB_DUST] * len(scripts)
+            values = [BPUB_DUST + 1] * len(scripts)
 
             fund = CMutableTransaction(
                 [CMutableTxIn(COutPoint(lx("00" * 32), 0))],
@@ -1179,24 +1266,38 @@ class ScriptExecutionTest(unittest.TestCase):
             )
             reveal = CMutableTransaction(
                 [CMutableTxIn(COutPoint(fund.GetTxid(), i)) for i in range(len(scripts))],
-                [CMutableTxOut(sum(values) - 450 * len(scripts), BCScript(b"\x00\x14" + b"\x11" * 20))],
+                [
+                    CMutableTxOut(
+                        sum(values) - 450 * len(scripts),
+                        BCScript(b"\x00\x14" + b"\x11" * 20),
+                    )
+                ],
             )
-            witnesses = []
-            for idx, rs in enumerate(scripts):
-                rs_bytes = bytes(rs)
-                sighash = SignatureHash(
-                    rs, reveal, idx, SIGHASH_ALL, values[idx], SIGVERSION_WITNESS_V0
-                )
-                sig = key.sign(sighash) + bytes([SIGHASH_ALL])
-                stack = [b"", sig, rs_bytes]
-                if version > 0:
-                    stack = make_pad_items(rs_bytes) + stack
-                witnesses.append(CScriptWitness(stack))
+            psbt = PSBT(unsigned_tx=reveal)
+            for idx, (rs, spk, val) in enumerate(zip(scripts, spks, values)):
+                psbt.set_utxo(CTxOut(val, BCScript(spk)), idx, force_witness_utxo=True)
+                psbt.inputs[idx].witness_script = rs
 
-            final_tx = CTransaction.deserialize(
-                reveal.serialize(include_witness=True), include_witness=True
-            )
+            out_buf = io.StringIO()
+            with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(
+                io.StringIO()
+            ):
+                bpub.cmd_signreveal(
+                    SimpleNamespace(
+                        psbt=psbt.to_base64(),
+                        wif=wif,
+                        control_pubkey=control_pubkey.hex(),
+                    )
+                )
+            raw_hex = out_buf.getvalue().strip()
+            final_tx = CTransaction.deserialize(bytes.fromhex(raw_hex))
+
             for idx in range(len(scripts)):
+                wit = final_tx.wit.vtxinwit[idx].scriptWitness
+                # padv3 and none carry no padding witness items (3 stack items);
+                # legacy padv1/padv2 carry 13 pad items (16 stack items).
+                expected_items = 16 if version in (1, 2) else 3
+                self.assertEqual(len(wit.stack), expected_items, f"v{version}")
                 VerifyScript(
                     BCScript(b""),
                     BCScript(spks[idx]),
@@ -1204,8 +1305,34 @@ class ScriptExecutionTest(unittest.TestCase):
                     idx,
                     flags=flags,
                     amount=values[idx],
-                    witness=witnesses[idx],
+                    witness=wit,
                 )
+
+            # Indexer must recognize and extract every variant, including padv3.
+            extracted = indexer.try_extract_bpub_from_tx(raw_hex)
+            self.assertIsNotNone(extracted, f"indexer missed v{version}")
+            meta, content = extracted
+            self.assertEqual(content, data, f"indexer content mismatch v{version}")
+            self.assertEqual(meta["script_suffix"], expected_kind)
+
+        # signreveal must refuse an unknown suffix rather than guess a witness.
+        rs_unknown = BCScript(bytes(scripts[0]) + b"\x61")
+        spk_unknown = bpub.p2wsh_scriptpubkey(rs_unknown)
+        tx_u = CMutableTransaction(
+            [CMutableTxIn(COutPoint(lx("11" * 32), 0))],
+            [CMutableTxOut(546, BCScript(b"\x00\x14" + b"\x11" * 20))],
+        )
+        psbt_u = PSBT(unsigned_tx=tx_u)
+        psbt_u.set_utxo(CTxOut(2000, BCScript(spk_unknown)), 0, force_witness_utxo=True)
+        psbt_u.inputs[0].witness_script = rs_unknown
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            bpub.cmd_signreveal(
+                SimpleNamespace(
+                    psbt=psbt_u.to_base64(),
+                    wif=wif,
+                    control_pubkey=control_pubkey.hex(),
+                )
+            )
 
 
 if __name__ == "__main__":

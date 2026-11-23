@@ -417,9 +417,9 @@ def bpub_utxos_from_tx(tx, txid: str, start: int, end: int) -> list:
     TXID:VOUT:VALUE strings for vouts start..end of a funding transaction,
     using each output's real value.
 
-    BPUB data outputs are sized per reveal feerate and staggered by 1 sat
-    (see bpub.bpub_output_values), so the values must never be assumed: a
-    wrong value makes the BIP143 signature for that input invalid.
+    BPUB data outputs are sized per reveal feerate (and floored at 547 sats,
+    see bpub.bpub_output_values), so the values must never be assumed to be
+    546: a wrong value makes the BIP143 signature for that input invalid.
     """
     if start < 0 or end < start:
         raise ValueError("Invalid vout range")
@@ -645,8 +645,8 @@ def flow_new_inscription():
         f"(total {num_data_outputs}), last two are owner+change."
     )
 
-    # The output values must be the real funded ones (they are sized for
-    # the reveal fee and staggered), never an assumed 546 sats.
+    # The output values must be the real funded ones (sized for the
+    # reveal fee and floored at 547 sats), never an assumed 546 sats.
     if (
         fund_unsigned_tx is not None
         and auto_funding_txid is not None
@@ -887,8 +887,8 @@ def flow_reveal():
             except Exception as e:
                 print(f"Invalid range: {e}")
 
-        # Output values are sized per reveal feerate and staggered, so
-        # they have to be read from the funding transaction itself.
+        # Output values are sized per reveal feerate (floored at 547 sats),
+        # so they have to be read from the funding transaction itself.
         print("\nLooking up BPUB output values via mempool.space API ...")
         bpub_utxos = bpub_utxos_from_mempool(txid, start, end)
         if bpub_utxos:
@@ -923,9 +923,9 @@ def flow_reveal():
     print(f"  Change addr : {change_addr}")
     print(f"  Feerate     : {feerate} sats/vbyte")
     print(
-        "\nNOTE: this wizard always builds reveal scripts with the current (v2) "
-        "padding suffix.\n"
-        "If these UTXOs were funded BEFORE the suffix existed (legacy "
+        "\nNOTE: this wizard always builds reveal scripts with the current "
+        "(padv3: 1-of-11 + OP_1 OP_EQUAL) layout.\n"
+        "If these UTXOs were funded BEFORE padv3 existed (legacy 1-of-15 "
         "scripts), the reveal\nwill not match them. In that case abort and "
         "use the CLI instead:\n"
         "  python3 bpub.py revealpsbt ... --legacy-scripts"

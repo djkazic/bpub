@@ -23,63 +23,64 @@ OP_(M+1)
 OP_CHECKMULTISIG
 ```
 
-### Script padding suffix (v2)
+### Script layout & suffix (`padv3`)
 
-By default the script also carries a padding suffix after
-`OP_CHECKMULTISIG`:
-
-```
-OP_TOALTSTACK
-OP_SIZE <64> OP_EQUAL OP_NOTIF
-OP_CHECKSIG x13
-OP_ENDIF
-OP_2DROP OP_2DROP OP_2DROP OP_2DROP OP_2DROP OP_2DROP OP_DROP
-OP_FROMALTSTACK
-```
-
-The reveal witness then carries 13 padding items before the usual
-`[dummy, signature, script]` stack. Each padding item is exactly 64 bytes:
+By default, BPUB uses a **1-of-11** multisig (10 data pubkeys = 310 bytes +
+1 control pubkey) with a 2-byte live suffix after `OP_CHECKMULTISIG`:
 
 ```
-0x30 0x3d 02 0x1c <28B r> 0x02 0x1d <29B s> 0x01
+OP_1
+<data_pk_0>
+...
+<data_pk_9>
+<control_pubkey>
+OP_11
+OP_CHECKMULTISIG
+OP_1
+OP_EQUAL
 ```
 
-with `r`/`s` derived deterministically as `sha512("BPUB-PAD-ITEM" || script
-|| index)`, first bytes masked so they are nonzero and below 0x80. The
-script discards the padding items via `OP_TOALTSTACK`/`OP_2DROP`/`OP_DROP`
-/`OP_FROMALTSTACK` around the 1-of-N spend; the guard's `<64>` assertion
-must equal the padding item size, and the `OP_NOTIF` branch never executes.
-
-Reveal witness layout (newest last):
+Because `OP_1 OP_EQUAL` simply verifies that `OP_CHECKMULTISIG` returned `1`,
+the reveal witness carries **no extra padding items**—just the standard
+1-of-N witness stack (newest last):
 
 ```
-<pad_0> ... <pad_12> <CHECKMULTISIG dummy = ""> <signature> <redeemScript>
+<CHECKMULTISIG dummy = ""> <signature> <redeemScript>
 ```
 
-**v1 suffix (legacy).** The first version used `OP_TOALTSTACK`, the drops,
-`OP_FROMALTSTACK`, then `OP_1 OP_NOTIF <13 OP_CHECKSIG> OP_ENDIF`. It is no
-longer buildable, but the parser, indexer, and `signreveal` still recognize
-it, so v1-funded outputs can still be recovered and spent (the v1 script
-can be reconstructed from this spec if ever needed). Use
-`--legacy-scripts` for UTXOs funded before any suffix existed.
+Keeping at most 10 data pubkeys per script stays within the 10-unproven-key
+per-input allowance under verified-key datacarrier recounting (Knots
+`v29.5.1+`, `knots#470`), while the trailing `OP_1 OP_EQUAL` avoids matching
+bare `OP_CHECKMULTISIG`-terminated multisig heuristics without introducing a
+dead branch or witness malleability.
+
+**`padv2` / `padv1` suffixes (legacy).** Earlier padded variants used 1-of-15
+multisigs with 13 `OP_CHECKSIG` padding opcodes in an `OP_NOTIF` branch
+(`OP_SIZE <64> OP_EQUAL OP_NOTIF` in `padv2`, `OP_1 OP_NOTIF` in `padv1`) and
+13 deterministic 64-byte DER-shaped padding items (`sha512("BPUB-PAD-ITEM" ||
+script || index)`) ahead of `[dummy, signature, script]`. They are no longer
+built by default, but the parser, indexer, and `signreveal` still recognize
+and sign them for already-funded outputs. Use `--legacy-scripts` for UTXOs
+funded with legacy suffix-free 1-of-15 scripts.
 
 ### Funding output values
 
-A padded reveal input measures ~406 vB on average (the fee estimator uses
-450 vB for headroom), so 546-sat funding outputs cannot always pay for
-their own reveal. `txbuild`/`fundpsbt` therefore size each BPUB data
-output by default to cover its share of the reveal at the assumed reveal
-feerate (`--reveal-feerate`, defaulting to the funding feerate):
+A `padv3` reveal input measures ~155 vB on average (the fee estimator uses
+175 vB for headroom). `txbuild`/`fundpsbt` size each BPUB data output by
+default to cover its share of the reveal at the assumed reveal feerate
+(`--reveal-feerate`, defaulting to the funding feerate):
 
 ```
-value_i = max(546, 450 * reveal_feerate + ceil((134 * reveal_feerate + 546) / n)) + i
+value_i = max(547, 175 * reveal_feerate + ceil((134 * reveal_feerate + 546) / n))
 ```
 
 where `134` vB is the reveal's fixed overhead (base + one output) and `n`
 the number of data outputs. The `+ 546 / n` share guarantees the reveal's
-change output clears the dust floor, and the `+ i` staggering ensures no
-three P2WSH outputs share a single value <= 546 sats. `--bpub-value`
-overrides the sizing with an exact per-output value.
+change output clears the dust floor, and flooring at `547` sats ensures no
+P2WSH output sits at or below `546` sats while keeping upfront capital
+linear (`O(n)`, at most `1 sat` per output over `546`) rather than
+quadratic. `--bpub-value` overrides the sizing with an exact per-output
+value.
 
 Version 5 introduces **mandatory ownership**, using a separate P2WSH output:
 ```

@@ -16,10 +16,10 @@ Environment:
   BPUB_SECP256K1_PATH   path to a python-bitcointx-compatible libsecp256k1
                         (e.g. v0.3.x) if the system one is too new
   BPUB_NODE_DATADIR     regtest datadir (default: a fresh dir under /tmp)
-  BPUB_NODE_MODE        "policy" (default): expects v2 reveal ALLOWED and
-                        both plain variants (legacy 1-of-15, plain 1-of-11)
-                        REJECTED (txn-datacarrier-*).
-                        "deadbranch": expects v2 reveal ALLOWED and the v1
+  BPUB_NODE_MODE        "policy" (default): expects padv3 reveal ALLOWED and
+                        padv2 (PR #470) + both plain variants (legacy 1-of-15,
+                        plain 1-of-11) REJECTED (txn-datacarrier-*).
+                        "deadbranch": expects padv3 reveal ALLOWED and the v1
                         suffix reveal REJECTED (txn-datacarrier-nonstandard).
   BPUB_NODE_EXTRA_ARGS  extra bitcoind args (space-separated)
 
@@ -62,7 +62,10 @@ from bitcointx.core.script import (
 )
 
 import bpub
+import indexer
 from bpub import (
+    MAX_PUBKEYS_PER_SCRIPT,
+    MAX_PUBKEYS_PER_SCRIPT_LEGACY,
     build_multisig_script,
     build_stream_v5,
     bpub_output_values,
@@ -108,16 +111,16 @@ def run_checks():
         "descriptor"
     ]
 
-    # Mine 103 blocks so the first three coinbases mature (one per variant).
-    print("mining 103 blocks ...")
-    for _ in range(103):
+    # Mine 104 blocks so the first four coinbases mature (one per variant).
+    print("mining 104 blocks ...")
+    for _ in range(104):
         cli("generateblock", mine_desc, "[]")
     height = int(cli("getblockcount"))
-    assert height == 103, height
+    assert height == 104, height
 
-    # Find the block-1..3 coinbases paying to mine_spk.
+    # Find the block-1..4 coinbases paying to mine_spk.
     coinbases = []
-    for h in (1, 2, 3):
+    for h in (1, 2, 3, 4):
         b = json.loads(cli("getblock", cli("getblockhash", h), 2))
         cb = b["tx"][0]
         vout = next(
@@ -129,53 +132,66 @@ def run_checks():
         print(f"coinbase {cb['txid']}:{vout} = {value} sats")
 
     # --- Build the BPUB data + scripts (all variants) ----------------------
-    data = os.urandom(1000)
+    # 5000 bytes -> ~17 padv3 1-of-11 scripts (all floored at 547 sats) and
+    # ~12 legacy 1-of-15 scripts, exercising both padv3 and O(n) 547-sat funding.
+    data = os.urandom(5000)
     stream = build_stream_v5(data, "application/octet-stream", "regtest.bin")
     data_pubkeys = encode_stream_to_pubkeys(stream)
-    chunks = list(chunk_data_pubkeys(data_pubkeys))
-    chunks10 = [data_pubkeys[i : i + 10] for i in range(0, len(data_pubkeys), 10)]
-    print(f"{len(data)} bytes -> {len(chunks)} 15-key scripts, "
-          f"{len(chunks10)} 11-key scripts")
+    chunks10 = list(chunk_data_pubkeys(data_pubkeys, max_pubkeys=MAX_PUBKEYS_PER_SCRIPT))
+    chunks14 = list(
+        chunk_data_pubkeys(data_pubkeys, max_pubkeys=MAX_PUBKEYS_PER_SCRIPT_LEGACY)
+    )
+    print(f"{len(data)} bytes -> {len(chunks10)} 11-key scripts, "
+          f"{len(chunks14)} 15-key scripts")
 
     def build_variant(name):
         """Returns (scripts, values) for a variant."""
-        if name == "padded":  # current v2 suffix
+        if name == "padv3":  # current 1-of-11 + OP_1 OP_EQUAL
             scripts = [
                 build_multisig_script(c, control_pub, pad_suffix=True)
-                for c in chunks
+                for c in chunks10
             ]
-        elif name == "v1":  # original suffix; no longer publicly buildable
-            scripts = []
-            for c in chunks:
-                base = bytes(
-                    build_multisig_script(c, control_pub, pad_suffix=False)
-                )
-                scripts.append(
-                    CScript(base + bpub._serialize_elems(bpub._pad_suffix_elems(1)))
-                )
-        elif name == "eleven":  # plain 1-of-11
+            values = bpub_output_values(len(scripts), 1, pad_suffix=True)
+        elif name == "padv2":  # legacy 1-of-15 + v2 padding suffix
+            scripts = [
+                build_multisig_script(c, control_pub, pad_suffix=2)
+                for c in chunks14
+            ]
+            # padv2 inputs are ~406 vB; size for 450 vB/input so fee clears dust
+            values = [max(547, 450 + (134 + 546 + len(scripts) - 1) // len(scripts))] * len(scripts)
+        elif name == "v1":  # legacy 1-of-15 + v1 dead-branch suffix
+            scripts = [
+                build_multisig_script(c, control_pub, pad_suffix=1)
+                for c in chunks14
+            ]
+            values = [max(547, 450 + (134 + 546 + len(scripts) - 1) // len(scripts))] * len(scripts)
+        elif name == "eleven":  # plain 1-of-11, no suffix
             scripts = [
                 build_multisig_script(c, control_pub, pad_suffix=False)
                 for c in chunks10
             ]
-        else:  # legacy, no suffix
+            values = bpub_output_values(len(scripts), 1, pad_suffix=True)
+        else:  # legacy 1-of-15, no suffix
             scripts = [
                 build_multisig_script(c, control_pub, pad_suffix=False)
-                for c in chunks
+                for c in chunks14
             ]
-        return scripts, bpub_output_values(len(scripts), 1)
+            values = bpub_output_values(len(scripts), 1, pad_suffix=False)
+        return scripts, values
 
     # (variant, expect_allowed, expect_reject_reason)
     if MODE == "deadbranch":
         plan = [
-            ("padded", True, None),
+            ("padv3", True, None),
             ("v1", False, "txn-datacarrier-nonstandard"),
         ]
     else:
-        # Default relay policy: plain variants are rejected; only the padded
-        # reveal passes.
+        # Default Knots v29.5.1+ relay policy (-datacarrierfullcount=1):
+        # padv3 passes; padv2 fails PR #470 (txn-datacarrier-exceeded);
+        # plain legacy 1-of-15 and plain 1-of-11 fail BPUBBytes.
         plan = [
-            ("padded", True, None),
+            ("padv3", True, None),
+            ("padv2", False, "txn-datacarrier-exceeded"),
             ("legacy", False, "txn-datacarrier"),
             ("eleven", False, "txn-datacarrier"),
         ]
@@ -190,7 +206,7 @@ def run_checks():
         spks = [p2wsh_scriptpubkey(rs) for rs in scripts]
         cb_txid, cb_vout, cb_value = coinbases[variant_idx]
         # --- Funding tx ---
-        fee_fund = 1000
+        fee_fund = 2000
         total_out = sum(values)
         fund = CMutableTransaction(
             [CMutableTxIn(COutPoint(lx(cb_txid), cb_vout))],
@@ -212,15 +228,20 @@ def run_checks():
 
         res = json.loads(cli("testmempoolaccept", json.dumps([fund_hex])))[0]
         print(f"[{name}] funding  testmempoolaccept: allowed={res.get('allowed')} "
-              f"reason={res.get('reject-reason')}")
+              f"reason={res.get('reject-reason')} (n={n}, val={min(values)}..{max(values)})")
         results[f"{name}-funding"] = res.get("allowed")
 
         txid = cli("sendrawtransaction", fund_hex)
         cli("generateblock", mine_desc, json.dumps([txid]))
 
         # --- Reveal tx ---
-        has_pad = name in ("padded", "v1")
-        fee_reveal = estimate_fee_reveal(n, 1, 1, pad_suffix=has_pad)
+        needs_pad_items = name in ("padv2", "v1")
+        if needs_pad_items:
+            fee_reveal = 100 + 450 * n + 34
+        else:
+            fee_reveal = estimate_fee_reveal(
+                n, 1, 1, pad_suffix=(name in ("padv3", "eleven"))
+            )
         reveal = CMutableTransaction(
             [CMutableTxIn(COutPoint(lx(txid), i)) for i in range(n)],
             [CMutableTxOut(total_out - fee_reveal, CScript(change_spk))],
@@ -232,7 +253,7 @@ def run_checks():
             )
             rsig = control_key.sign(sigh) + bytes([SIGHASH_ALL])
             stack = [b"", rsig, rs_bytes]
-            if has_pad:
+            if needs_pad_items:
                 stack = make_pad_items(rs_bytes) + stack
             reveal.wit.vtxinwit[idx].scriptWitness = CScriptWitness(stack)
         reveal_hex = reveal.serialize(include_witness=True).hex()
@@ -247,23 +268,33 @@ def run_checks():
             rtxid = cli("sendrawtransaction", reveal_hex)
             blk = json.loads(cli("generateblock", mine_desc, json.dumps([rtxid])))
             print(f"[{name}] reveal mined: {rtxid}")
-            if name == "padded":
-                # recover the data straight from the chain
+            if name == "padv3":
+                # Recover the data straight from the chain via both bpub and indexer.
                 raw = cli("getrawtransaction", rtxid, "false", blk["hash"])
                 all_pks = []
                 from bitcointx.core import CTransaction
                 tx = CTransaction.deserialize(bytes.fromhex(raw))
                 for i in range(len(tx.vin)):
                     ws = tx.wit.vtxinwit[i].scriptWitness.stack
+                    assert len(ws) == 3, f"expected 3 witness items for padv3, got {len(ws)}"
                     parsed = bpub.parse_bpub_multisig(bytes(ws[-1]))
-                    assert parsed and parsed[2] == "padv2"
+                    assert parsed and parsed[2] == "padv3"
                     all_pks.extend(parsed[0])
                 meta, content = bpub.decode_stream(
                     bpub.decode_pubkeys_to_stream(all_pks)
                 )
                 assert content == data, "recovered data mismatch!"
-                print(f"[{name}] data recovered from chain OK "
-                      f"({meta['size']} bytes, bpub_id={meta['bpub_id'].hex()[:16]}...)")
+
+                idx_res = indexer.try_extract_bpub_from_tx(raw)
+                assert idx_res is not None, "indexer failed to extract padv3 reveal!"
+                idx_meta, idx_content = idx_res
+                assert idx_content == data, "indexer recovered data mismatch!"
+                assert idx_meta["script_suffix"] == "padv3", idx_meta
+                print(
+                    f"[{name}] data recovered from chain + indexer OK "
+                    f"({meta['size']} bytes, suffix={idx_meta['script_suffix']}, "
+                    f"bpub_id={meta['bpub_id'].hex()[:16]}...)"
+                )
         else:
             # clean the spent outputs so the next variant can try: they were
             # not spent (reveal rejected), so nothing to do.

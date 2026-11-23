@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 BPUB indexer: scan the Bitcoin blockchain for BPUB reveal transactions
-(v3.5 legacy and v4 stealth) and build a simple on-disk "gallery":
+(v3.5 legacy, v4 stealth, and v5 stealth with ownership) and build a simple
+on-disk "gallery":
 
     GALLERY_DIR/
       manifest.json
@@ -11,13 +12,15 @@ BPUB indexer: scan the Bitcoin blockchain for BPUB reveal transactions
 - Connects to bitcoind via RPC.
 - Starts from a configured height (and optional hash sanity-check).
 - Runs forever, polling for new blocks.
-- Auto-detects BPUB-style 1-of-N multisig P2WSH spends and reconstructs
-  the embedded BPUB stream via bpub.decode_*().
+- Auto-detects BPUB-style 1-of-N multisig P2WSH spends (legacy suffix-free,
+  padv1, padv2, padv3, and unknown trailing suffixes) via
+  bpub.parse_bpub_multisig() and reconstructs the embedded BPUB stream via
+  bpub.decode_*().
 
 This works with:
 
 - BPUB v3.5 streams (with "BPUB" magic + TLV header).
-- BPUB v4 stealth streams (headerless, raw DEFLATE + XOR).
+- BPUB v4/v5 stealth streams (headerless, raw DEFLATE + XOR).
 """
 
 import os
@@ -29,8 +32,15 @@ import hashlib
 from pathlib import Path
 from typing import Optional, Tuple, List
 
-from dotenv import load_dotenv
-from bitcoinrpc.authproxy import AuthServiceProxy
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
+try:
+    from bitcoinrpc.authproxy import AuthServiceProxy
+except ImportError:
+    AuthServiceProxy = None
 
 from bitcointx.core import CTransaction
 from bitcointx.core.script import CScript
@@ -46,6 +56,8 @@ from bpub import (
 
 def load_config():
     """Load config from .env and environment variables."""
+    if load_dotenv is None:
+        sys.exit("python-dotenv is required to run indexer.py")
     load_dotenv()
 
     rpc_user = os.getenv("BITCOIN_RPC_USER")
@@ -80,6 +92,8 @@ def load_config():
 
 
 def make_rpc(config):
+    if AuthServiceProxy is None:
+        sys.exit("python-bitcoinrpc is required to run indexer.py")
     uri = (
         f"http://{config['rpc_user']}:{config['rpc_pass']}@"
         f"{config['rpc_host']}:{config['rpc_port']}"
@@ -196,6 +210,7 @@ def try_extract_bpub_from_tx(rawtx_hex: str):
 
     all_data_pubkeys: List[bytes] = []
     detected_controls: List[bytes] = []
+    suffix_kinds = set()
 
     for idx, vin in enumerate(tx.vin):
         if idx >= len(tx.wit.vtxinwit):
@@ -211,8 +226,9 @@ def try_extract_bpub_from_tx(rawtx_hex: str):
         if parsed is None:
             continue
 
-        data_pks, control_pk_here, _suffix_kind = parsed
+        data_pks, control_pk_here, suffix_kind = parsed
         detected_controls.append(control_pk_here)
+        suffix_kinds.add(suffix_kind)
         all_data_pubkeys.extend(data_pks)
 
     if not all_data_pubkeys:
@@ -230,6 +246,11 @@ def try_extract_bpub_from_tx(rawtx_hex: str):
 
     if "bpub_version" not in meta:
         meta["bpub_version"] = "unknown"
+
+    if len(suffix_kinds) == 1:
+        meta["script_suffix"] = next(iter(suffix_kinds))
+    else:
+        meta["script_suffix"] = "mixed"
 
     return meta, content
 
