@@ -538,6 +538,13 @@ def secp256k1_available():
 SECP256K1 = secp256k1_available()
 SECP_SKIP = "no compatible libsecp256k1 (set BPUB_SECP256K1_PATH)"
 
+# wizard.py needs bip-utils and requests on top of python-bitcointx.
+try:
+    import wizard  # noqa: E402
+except ImportError:
+    wizard = None
+WIZARD_SKIP = "wizard.py dependencies (bip-utils, requests) not installed"
+
 
 # ---------------------------------------------------------------------------
 # Tests
@@ -826,6 +833,190 @@ class WizardNamespaceTest(unittest.TestCase):
         with contextlib.redirect_stdout(buf):
             bpub.cmd_revealpsbt(args)
         self.assertTrue(buf.getvalue().strip())
+
+
+class WizardRevealValuesTest(unittest.TestCase):
+    """
+    The wizard must feed revealpsbt the real funded value of every BPUB
+    data output. Funding outputs are sized and staggered, so assuming
+    546 sats either trips the change-is-dust check or (worse) produces
+    BIP143 signatures committing to the wrong amount.
+    """
+
+    FUND_TXID = "bb" * 32
+
+    def _fund(self, tmpdir, size, feerate=1):
+        from bitcointx.core.key import CKey
+        from bitcointx.core.psbt import PartiallySignedTransaction as PSBT
+        from bitcointx.wallet import P2WPKHBitcoinAddress
+
+        import contextlib
+        import io
+
+        path = os.path.join(tmpdir, "payload.bin")
+        with open(path, "wb") as f:
+            f.write(os.urandom(size))
+        key = CKey.from_secret_bytes(CONTROL_SECRET)
+        other = CKey.from_secret_bytes(hashlib.sha256(b"change").digest())
+        addr = str(P2WPKHBitcoinAddress.from_pubkey(other.pub))
+        common = dict(
+            file=path,
+            mime="application/octet-stream",
+            filename="payload.bin",
+            compress=False,
+            legacy_v3=False,
+            v4=False,
+            control_pubkey=bytes(key.pub).hex(),
+            change=addr,
+            feerate=feerate,
+            legacy_scripts=False,
+        )
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(
+            io.StringIO()
+        ):
+            bpub.cmd_fundpsbt(
+                SimpleNamespace(
+                    owner_address=addr,
+                    utxo=f"{'aa' * 32}:0",
+                    value=1_000_000,
+                    prev_address=addr,
+                    prev_spk=None,
+                    **common,
+                )
+            )
+        fund_tx = PSBT.from_base64(buf.getvalue().strip()).unsigned_tx
+        return key, common, fund_tx
+
+    def _reveal_and_verify(self, key, common, fund_tx, bpub_utxos):
+        import contextlib
+        import io
+
+        from bitcointx.core import CTransaction, x
+        from bitcointx.core.scripteval import (
+            VerifyScript,
+            SCRIPT_VERIFY_P2SH,
+            SCRIPT_VERIFY_WITNESS,
+            SCRIPT_VERIFY_NULLDUMMY,
+            SCRIPT_VERIFY_CLEANSTACK,
+            SCRIPT_VERIFY_DERSIG,
+            SCRIPT_VERIFY_LOW_S,
+            SCRIPT_VERIFY_STRICTENC,
+            SCRIPT_VERIFY_NULLFAIL,
+            SCRIPT_VERIFY_MINIMALIF,
+            SCRIPT_VERIFY_WITNESS_PUBKEYTYPE,
+        )
+        from bitcointx.wallet import CBitcoinSecret
+
+        flags = {
+            SCRIPT_VERIFY_P2SH,
+            SCRIPT_VERIFY_WITNESS,
+            SCRIPT_VERIFY_NULLDUMMY,
+            SCRIPT_VERIFY_CLEANSTACK,
+            SCRIPT_VERIFY_DERSIG,
+            SCRIPT_VERIFY_LOW_S,
+            SCRIPT_VERIFY_STRICTENC,
+            SCRIPT_VERIFY_NULLFAIL,
+            SCRIPT_VERIFY_MINIMALIF,
+            SCRIPT_VERIFY_WITNESS_PUBKEYTYPE,
+        }
+
+        def run(cmd, args):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(
+                io.StringIO()
+            ):
+                cmd(args)
+            return buf.getvalue().strip()
+
+        reveal_psbt = run(
+            bpub.cmd_revealpsbt, SimpleNamespace(bpub_utxo=bpub_utxos, **common)
+        )
+        wif = str(CBitcoinSecret.from_secret_bytes(key.secret_bytes))
+        raw_hex = run(
+            bpub.cmd_signreveal,
+            SimpleNamespace(
+                psbt=reveal_psbt, wif=wif, control_pubkey=common["control_pubkey"]
+            ),
+        )
+        tx = CTransaction.deserialize(x(raw_hex))
+        self.assertEqual(len(tx.vin), len(bpub_utxos))
+        # Verify every input against the REAL funding output it spends.
+        for idx, txin in enumerate(tx.vin):
+            prevout = fund_tx.vout[txin.prevout.n]
+            VerifyScript(
+                CScript(b""),
+                prevout.scriptPubKey,
+                tx,
+                idx,
+                flags=flags,
+                amount=prevout.nValue,
+                witness=tx.wit.vtxinwit[idx].scriptWitness,
+            )
+
+    @unittest.skipUnless(SECP256K1, SECP_SKIP)
+    @unittest.skipUnless(wizard is not None, WIZARD_SKIP)
+    def test_wizard_values_sign_validly(self):
+        import tempfile
+
+        from bitcointx.core.scripteval import VerifyScriptError
+
+        # (payload size, expected data outputs): n=2 is sized above the
+        # dust floor; n=8 sits on the floor and differs only by the stagger.
+        for size, n in ((300, 2), (3000, 8)):
+            with self.subTest(n=n), tempfile.TemporaryDirectory() as tmp:
+                key, common, fund_tx = self._fund(tmp, size)
+                self.assertEqual(len(fund_tx.vout), n + 2)
+                expected = bpub_output_values(n, 1)
+                self.assertEqual(
+                    [o.nValue for o in fund_tx.vout[:n]], expected
+                )
+
+                utxos = wizard.bpub_utxos_from_tx(
+                    fund_tx, self.FUND_TXID, 0, n - 1
+                )
+                self.assertEqual(
+                    utxos,
+                    [f"{self.FUND_TXID}:{i}:{v}" for i, v in enumerate(expected)],
+                )
+                self._reveal_and_verify(key, common, fund_tx, utxos)
+
+                # The old behaviour (546 for every output) must not verify.
+                assumed = [f"{self.FUND_TXID}:{i}:{BPUB_DUST}" for i in range(n)]
+                with self.assertRaises((SystemExit, VerifyScriptError)):
+                    self._reveal_and_verify(key, common, fund_tx, assumed)
+
+    @unittest.skipUnless(wizard is not None, WIZARD_SKIP)
+    def test_utxos_from_tx_range_checked(self):
+        tx = SimpleNamespace(
+            vout=[SimpleNamespace(nValue=v) for v in (790, 791, 10000, 5000)]
+        )
+        self.assertEqual(
+            wizard.bpub_utxos_from_tx(tx, "ab", 0, 1), ["ab:0:790", "ab:1:791"]
+        )
+        with self.assertRaises(ValueError):
+            wizard.bpub_utxos_from_tx(tx, "ab", 0, 4)
+
+    @unittest.skipUnless(wizard is not None, WIZARD_SKIP)
+    def test_utxos_from_mempool(self):
+        import contextlib
+        import io
+        from unittest import mock
+
+        def lookup(response, start, end):
+            with mock.patch.object(
+                wizard, "fetch_tx_from_mempool", return_value=response
+            ), contextlib.redirect_stdout(io.StringIO()):
+                return wizard.bpub_utxos_from_mempool("ab", start, end)
+
+        tx = {"vout": [{"value": 546}, {"value": 547}, {"value": 10000}]}
+        self.assertEqual(lookup(tx, 0, 1), ["ab:0:546", "ab:1:547"])
+        # Lookup failure, out-of-range and malformed values never fall
+        # back to an assumed value.
+        self.assertIsNone(lookup(None, 0, 1))
+        self.assertIsNone(lookup(tx, 0, 3))
+        self.assertIsNone(lookup({"vout": [{"value": None}]}, 0, 0))
+        self.assertIsNone(lookup({"vout": [{}]}, 0, 0))
 
 
 class ScriptExecutionTest(unittest.TestCase):

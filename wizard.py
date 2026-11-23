@@ -28,7 +28,6 @@ import bpub
 select_chain_params(BitcoinMainnetParams)
 
 SEED_FILE = "seed.txt"
-DUST_SATS = 546
 
 
 def _normalize_mnemonic(m: str) -> str:
@@ -413,6 +412,66 @@ def _parse_vout_range(r: str) -> Tuple[int, int]:
     return start, end
 
 
+def bpub_utxos_from_tx(tx, txid: str, start: int, end: int) -> list:
+    """
+    TXID:VOUT:VALUE strings for vouts start..end of a funding transaction,
+    using each output's real value.
+
+    BPUB data outputs are sized per reveal feerate and staggered by 1 sat
+    (see bpub.bpub_output_values), so the values must never be assumed: a
+    wrong value makes the BIP143 signature for that input invalid.
+    """
+    if start < 0 or end < start:
+        raise ValueError("Invalid vout range")
+    if end >= len(tx.vout):
+        raise ValueError(
+            f"vout {end} out of range; transaction has {len(tx.vout)} outputs"
+        )
+    return [f"{txid}:{vout}:{tx.vout[vout].nValue}" for vout in range(start, end + 1)]
+
+
+def bpub_utxos_from_mempool(txid: str, start: int, end: int) -> Optional[list]:
+    """
+    Same as bpub_utxos_from_tx, but reads the output values from
+    mempool.space. Returns None if any value cannot be determined.
+    """
+    tx = fetch_tx_from_mempool(txid)
+    if tx is None:
+        return None
+
+    vouts = tx.get("vout", [])
+    if not isinstance(vouts, list):
+        print("Unexpected mempool.space format for vout.")
+        return None
+    if start < 0 or end < start or end >= len(vouts):
+        print(
+            f"Vout range {start}..{end} out of range; "
+            f"transaction has {len(vouts)} outputs."
+        )
+        return None
+
+    utxos = []
+    for vout in range(start, end + 1):
+        out = vouts[vout]
+        value = out.get("value") if isinstance(out, dict) else None
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            print(f"Unexpected mempool.space value for vout {vout}.")
+            return None
+        utxos.append(f"{txid}:{vout}:{value}")
+    return utxos
+
+
+def prompt_bpub_utxos_manual() -> list:
+    print("Enter each BPUB UTXO as TXID:VOUT:VALUE, blank line to finish.")
+    utxos = []
+    while True:
+        line = input("> ").strip()
+        if not line:
+            break
+        utxos.append(line)
+    return utxos
+
+
 def flow_new_inscription():
     print("\n=== New inscription pipeline (funding + reveal + sign) ===")
 
@@ -586,11 +645,36 @@ def flow_new_inscription():
         f"(total {num_data_outputs}), last two are owner+change."
     )
 
-    bpub_utxos = [
-        f"{funding_txid}:{vout}:{DUST_SATS}" for vout in range(start_vout, end_vout + 1)
-    ]
-
-    print("\nBPUB data UTXOs (assuming 546 sats each):")
+    # The output values must be the real funded ones (they are sized for
+    # the reveal fee and staggered), never an assumed 546 sats.
+    if (
+        fund_unsigned_tx is not None
+        and auto_funding_txid is not None
+        and funding_txid == auto_funding_txid
+    ):
+        bpub_utxos = bpub_utxos_from_tx(
+            fund_unsigned_tx, funding_txid, start_vout, end_vout
+        )
+        print("\nBPUB data UTXOs (values from the funding PSBT):")
+    else:
+        print(
+            "\nFunding txid differs from the PSBT built above (or the PSBT "
+            "could not be parsed);\nlooking up BPUB output values via "
+            "mempool.space API ..."
+        )
+        bpub_utxos = bpub_utxos_from_mempool(funding_txid, start_vout, end_vout)
+        if bpub_utxos:
+            print("\nBPUB data UTXOs (values from mempool.space):")
+        else:
+            print(
+                "  Could not determine BPUB output values automatically; "
+                "enter them manually."
+            )
+            bpub_utxos = prompt_bpub_utxos_manual()
+            if not bpub_utxos:
+                print("No BPUB UTXOs provided, aborting reveal stage.")
+                return
+            print("\nBPUB data UTXOs (entered manually):")
     for u in bpub_utxos:
         print("  ", u)
 
@@ -795,8 +879,6 @@ def flow_reveal():
 
     if prompt_yes_no("Auto-generate from a vout range?", default=True):
         txid = prompt_nonempty("Funding TXID for BPUB outputs")
-        value_each = DUST_SATS
-        print(f"Assuming each BPUB data output is {DUST_SATS} sats.")
         while True:
             try:
                 rng = prompt_nonempty("Vout range (e.g. 0:19 or 0-19)")
@@ -805,19 +887,22 @@ def flow_reveal():
             except Exception as e:
                 print(f"Invalid range: {e}")
 
-        for vout in range(start, end + 1):
-            bpub_utxos.append(f"{txid}:{vout}:{value_each}")
-
-        print(f"\nGenerated {len(bpub_utxos)} BPUB UTXOs:")
-        for u in bpub_utxos:
-            print("  ", u)
+        # Output values are sized per reveal feerate and staggered, so
+        # they have to be read from the funding transaction itself.
+        print("\nLooking up BPUB output values via mempool.space API ...")
+        bpub_utxos = bpub_utxos_from_mempool(txid, start, end)
+        if bpub_utxos:
+            print(f"\nGenerated {len(bpub_utxos)} BPUB UTXOs:")
+            for u in bpub_utxos:
+                print("  ", u)
+        else:
+            print(
+                "  Could not determine BPUB output values automatically "
+                "(is the funding tx broadcast?);\n  enter them manually."
+            )
+            bpub_utxos = prompt_bpub_utxos_manual()
     else:
-        print("Enter each BPUB UTXO as TXID:VOUT:VALUE, blank line to finish.")
-        while True:
-            line = input("> ").strip()
-            if not line:
-                break
-            bpub_utxos.append(line)
+        bpub_utxos = prompt_bpub_utxos_manual()
 
     if not bpub_utxos:
         print("No BPUB UTXOs provided, aborting.")
