@@ -929,6 +929,35 @@ def bpub_output_values(n_outputs: int, reveal_feerate: int, bpub_value: int = No
     return [base + i for i in range(n_outputs)]
 
 
+def reveal_feerate_budget(values, pad_suffix: bool = True):
+    """
+    Return (reserved_feerate, max_feerate) in sat/vB for a reveal spending
+    BPUB outputs with the given satoshi values.
+
+    When the values follow bpub_output_values()'s 1-sat stagger
+    (base, base+1, ..., base+n-1), reserved_feerate excludes that stagger
+    margin while max_feerate is the dust ceiling using all available sats.
+    For unstaggered or custom values (e.g. --bpub-value or legacy 546-sat
+    fundings), no phantom stagger is subtracted and both values match.
+    """
+    n = len(values)
+    if n < 1:
+        return 0, 0
+    per_input_vb = (
+        REVEAL_INPUT_VBYTES if pad_suffix else REVEAL_INPUT_VBYTES_LEGACY
+    )
+    total_vb = REVEAL_BASE_VBYTES + 34 + per_input_vb * n
+    total_in = sum(values)
+    ordered = sorted(values)
+    if n > 1 and all(ordered[i] == ordered[0] + i for i in range(n)):
+        stagger = n * (n - 1) // 2
+    else:
+        stagger = 0
+    reserved_feerate = (total_in - BPUB_DUST - stagger) // total_vb
+    max_feerate = (total_in - BPUB_DUST) // total_vb
+    return reserved_feerate, max_feerate
+
+
 def estimate_fee_ot(n_inputs: int, n_outputs: int, feerate: int) -> int:
     base_vbytes = 10
     in_vbytes = n_inputs * 94
@@ -1414,16 +1443,12 @@ def cmd_revealpsbt(args):
         psbt.set_utxo(prevout, idx, force_witness_utxo=True)
         psbt.inputs[idx].witness_script = rs
 
-    # Report the feerate these UTXO values reserve (per the funding sizing
-    # formula: reveal fee + dust share + 1-sat stagger) and the hard ceiling
-    # where the change output turns to dust.
-    per_input_vb = (
-        REVEAL_INPUT_VBYTES if pad_suffix else REVEAL_INPUT_VBYTES_LEGACY
+    # Report the feerate these UTXO values reserve (excluding the 1-sat
+    # stagger only when the inputs actually follow that staggered pattern)
+    # and the hard ceiling where the change output turns to dust.
+    reserved_feerate, max_feerate = reveal_feerate_budget(
+        [u.value_sats for u in utxos], pad_suffix=pad_suffix
     )
-    total_vb = REVEAL_BASE_VBYTES + 34 + per_input_vb * len(utxos)
-    stagger = len(utxos) * (len(utxos) - 1) // 2
-    reserved_feerate = (total_in - DUST - stagger) // total_vb
-    max_feerate = (total_in - DUST) // total_vb
     sys.stderr.write(
         f"# Built BPUB {version_label} reveal PSBT with {len(utxos)} inputs, 1 output, "
         f"fee≈{fee} sats\n"

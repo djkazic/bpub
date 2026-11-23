@@ -51,6 +51,7 @@ from bpub import (  # noqa: E402
     estimate_fee_reveal,
     make_pad_items,
     parse_bpub_multisig,
+    reveal_feerate_budget,
 )
 
 # ---------------------------------------------------------------------------
@@ -796,6 +797,88 @@ class FundingEconomicsTest(unittest.TestCase):
 
     def test_override_exact(self):
         self.assertEqual(bpub_output_values(5, 1, bpub_value=1000), [1000] * 5)
+
+    def test_reveal_feerate_budget_staggered(self):
+        for feerate in (1, 2, 5, 20):
+            for n in (1, 2, 8, 50, 250):
+                values = bpub_output_values(n, feerate)
+                reserved, ceiling = reveal_feerate_budget(values, pad_suffix=True)
+                self.assertGreaterEqual(reserved, feerate)
+                self.assertGreaterEqual(ceiling, reserved)
+                # Input order must not affect detection of the 1-sat stagger.
+                self.assertEqual(
+                    reveal_feerate_budget(list(reversed(values)), pad_suffix=True),
+                    (reserved, ceiling),
+                )
+        # At n=1000, 1 sat/vB, the 1-sat stagger adds enough sats to raise the
+        # dust ceiling above the reserved feerate.
+        reserved, ceiling = reveal_feerate_budget(
+            bpub_output_values(1000, 1), pad_suffix=True
+        )
+        self.assertEqual(reserved, 1)
+        self.assertEqual(ceiling, 2)
+
+    def test_reveal_feerate_budget_unstaggered(self):
+        # Uniform --bpub-value 546 (no stagger): 250 padded inputs easily cover
+        # 1 sat/vB with 23,866 sats of change; must not subtract phantom stagger.
+        reserved, ceiling = reveal_feerate_budget([BPUB_DUST] * 250, pad_suffix=True)
+        self.assertEqual((reserved, ceiling), (1, 1))
+
+        # Uniform legacy 546-sat outputs (no stagger): 400 legacy inputs cover
+        # 2 sat/vB (previously under-reported as 1 sat/vB).
+        reserved, ceiling = reveal_feerate_budget([BPUB_DUST] * 400, pad_suffix=False)
+        self.assertEqual((reserved, ceiling), (2, 2))
+
+        # Arbitrary custom values (non-staggered) use their real total.
+        reserved, ceiling = reveal_feerate_budget([BPUB_DUST, 50000], pad_suffix=True)
+        self.assertEqual((reserved, ceiling), (48, 48))
+
+    @unittest.skipUnless(SECP256K1, SECP_SKIP)
+    def test_revealpsbt_no_spurious_warning_for_unstaggered_utxos(self):
+        import contextlib
+        import io
+        import tempfile
+
+        from bitcointx.wallet import P2WPKHBitcoinAddress
+
+        # 250 uniform 546-sat padded UTXOs at 1 sat/vB leave ~23,866 sats of
+        # change and must neither report 0 sat/vB nor emit a margin warning.
+        payload = b"\x42" * 108_000
+        stream = build_stream_v5(payload, "application/octet-stream", "big.bin")
+        n_chunks = len(list(chunk_data_pubkeys(encode_stream_to_pubkeys(stream))))
+        self.assertEqual(n_chunks, 250)
+
+        control_pubkey = "02" + "11" * 32
+        change_addr = str(
+            P2WPKHBitcoinAddress.from_scriptPubKey(CScript([0, b"\x11" * 20]))
+        )
+        fake = "aa" * 32
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "big.bin")
+            with open(path, "wb") as f:
+                f.write(payload)
+            args = SimpleNamespace(
+                file=path,
+                mime="application/octet-stream",
+                filename="big.bin",
+                compress=False,
+                legacy_v3=False,
+                v4=False,
+                control_pubkey=control_pubkey,
+                bpub_utxo=[f"{fake}:{i}:{BPUB_DUST}" for i in range(n_chunks)],
+                change=change_addr,
+                feerate=1,
+                legacy_scripts=False,
+            )
+            out_buf = io.StringIO()
+            err_buf = io.StringIO()
+            with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+                bpub.cmd_revealpsbt(args)
+
+        self.assertTrue(out_buf.getvalue().strip())
+        err = err_buf.getvalue()
+        self.assertIn("reserve ~1 sat/vB", err)
+        self.assertNotIn("WARNING: requested feerate exceeds", err)
 
 
 class WizardNamespaceTest(unittest.TestCase):
