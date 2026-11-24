@@ -402,5 +402,35 @@ input:focus, select:focus, textarea:focus {
   margin-top: 0.35rem;
 }
 
+.invoice-layout {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  align-items: flex-start;
+  margin: 0.5rem 0 0.85rem;
+}
+
+.invoice-qr-wrap {
+  background: #fff;
+  padding: 0.5rem;
+  border-radius: 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+}
+
+.invoice-qr {
+  display: block;
+  width: 220px;
+  height: 220px;
+  image-rendering: pixelated;
+}
+
+.invoice-col {
+  flex: 1 1 260px;
+  min-width: 0;
+}
+
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }

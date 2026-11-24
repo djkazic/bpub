@@ -10,6 +10,7 @@
     ordersEnabled: false,
     maxUploadBytes: 190 * 1024,
     activeOrderId: null,
+    lastOrderRenderKey: null,
     orderPollTimer: null,
     modalTxid: null,
   };
@@ -461,6 +462,17 @@
   $('order-compress').addEventListener('change', updateOrderQuote);
 
   function renderOrderStatus(order) {
+    const renderKey = JSON.stringify([
+      order.order_id,
+      order.status,
+      order.payment_request || '',
+      order.funding_txid || '',
+      order.reveal_txid || '',
+      order.error_message || '',
+    ]);
+    if (renderKey === state.lastOrderRenderKey) return;
+    state.lastOrderRenderKey = renderKey;
+
     const panel = $('order-status-panel');
     const body = $('order-status-body');
     panel.classList.remove('hidden');
@@ -474,20 +486,45 @@
     if (order.payment_request && order.status === 'awaiting_payment') {
       const p = document.createElement('p');
       p.className = 'info';
-      p.textContent = 'Pay this Lightning invoice to begin your on-chain padv3 inscription:';
+      p.textContent = 'Scan or copy this Lightning invoice to begin your on-chain padv3 inscription:';
       body.appendChild(p);
 
+      const invLayout = document.createElement('div');
+      invLayout.className = 'invoice-layout';
+
+      if (typeof order.payment_request_qr === 'string' && order.payment_request_qr.startsWith('data:image/png;base64,')) {
+        const qrWrap = document.createElement('div');
+        qrWrap.className = 'invoice-qr-wrap';
+        const img = document.createElement('img');
+        img.className = 'invoice-qr';
+        img.src = order.payment_request_qr;
+        img.alt = 'Lightning BOLT11 invoice QR code';
+        qrWrap.appendChild(img);
+        invLayout.appendChild(qrWrap);
+      }
+
+      const invCol = document.createElement('div');
+      invCol.className = 'invoice-col';
       const ta = document.createElement('textarea');
       ta.readOnly = true;
-      ta.rows = 3;
+      ta.rows = 4;
       ta.className = 'mono invoice-box';
       ta.value = order.payment_request;
-      body.appendChild(ta);
+      invCol.appendChild(ta);
 
       const row = document.createElement('div');
       row.className = 'actions-row';
       row.appendChild(makeCopyButton('Copy Invoice', order.payment_request));
-      body.appendChild(row);
+      if (/^ln[a-z0-9]+$/i.test(order.payment_request)) {
+        const walletLink = document.createElement('a');
+        walletLink.className = 'btn btn-secondary btn-sm';
+        walletLink.href = 'lightning:' + order.payment_request;
+        walletLink.textContent = 'Open in Wallet';
+        row.appendChild(walletLink);
+      }
+      invCol.appendChild(row);
+      invLayout.appendChild(invCol);
+      body.appendChild(invLayout);
     }
 
     if (order.status === 'awaiting_liquidity') {

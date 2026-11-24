@@ -56,6 +56,26 @@ try:
 except ImportError:
     pass
 
+try:
+    import segno
+except ImportError:
+    segno = None
+
+
+def _make_bolt11_qr_data_uri(payment_request: Optional[str]) -> Optional[str]:
+    """
+    Generate a self-contained PNG data URI QR code for a BOLT11 invoice.
+    Uses uppercase `LIGHTNING:<BOLT11>` so QR encodes in Alphanumeric mode
+    (lower density, faster mobile wallet scanning) with zero external requests.
+    """
+    if segno is None or not payment_request or not isinstance(payment_request, str):
+        return None
+    clean = payment_request.strip()
+    if not clean:
+        return None
+    qr = segno.make(f"LIGHTNING:{clean.upper()}", error="m")
+    return qr.png_data_uri(scale=5, border=4)
+
 
 # ---------------------------------------------------------------------------
 # Configuration & Validation Constants
@@ -779,6 +799,11 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(e))
         except LndError as e:
             raise HTTPException(status_code=502, detail=f"Lightning node error: {e}")
+        order["payment_request_qr"] = (
+            _make_bolt11_qr_data_uri(order.get("payment_request"))
+            if order.get("status") == "awaiting_payment"
+            else None
+        )
         return order
 
     @app.get("/api/orders/{order_id}")
@@ -791,6 +816,11 @@ def create_app(
             order = db.get_order_public(order_id)
         if order is None:
             raise HTTPException(status_code=404, detail="Order not found")
+        order["payment_request_qr"] = (
+            _make_bolt11_qr_data_uri(order.get("payment_request"))
+            if order.get("status") == "awaiting_payment"
+            else None
+        )
         if explorer_url:
             order["funding_explorer_url"] = (
                 f"{explorer_url}/tx/{order['funding_txid']}"

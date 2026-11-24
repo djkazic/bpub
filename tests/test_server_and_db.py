@@ -693,6 +693,11 @@ class ServerSecurityAndApiTest(unittest.TestCase):
             order_id = odata["order_id"]
             self.assertEqual(odata["status"], "awaiting_payment")
             self.assertTrue(odata["payment_request"].startswith("lnbc"))
+            if server.segno is not None:
+                self.assertIsInstance(odata["payment_request_qr"], str)
+                self.assertTrue(
+                    odata["payment_request_qr"].startswith("data:image/png;base64,iVBORw0KGgo")
+                )
             # Secrets must never leak in API responses.
             self.assertNotIn("control_privkey_hex", odata)
             self.assertNotIn("payload_path", odata)
@@ -726,6 +731,7 @@ class ServerSecurityAndApiTest(unittest.TestCase):
             self.assertEqual(rstat.status_code, 200)
             sdata = rstat.json()
             self.assertEqual(sdata["status"], "completed")
+            self.assertIsNone(sdata["payment_request_qr"])
             self.assertIsNotNone(sdata["funding_txid"])
             self.assertIsNotNone(sdata["reveal_txid"])
             self.assertEqual(len(fake_wallet.broadcasts), 2)
