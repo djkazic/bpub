@@ -110,10 +110,26 @@ SAFE_MEDIA_MIMES: Dict[str, str] = {
     ".png": "image/png",
     ".gif": "image/gif",
     ".webp": "image/webp",
+    ".mp4": "video/mp4",
+    ".webm": "video/webm",
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".ogg": "audio/ogg",
     ".txt": "text/plain; charset=utf-8",
     ".bin": "application/octet-stream",
 }
-INLINE_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+INLINE_MEDIA_EXTS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".webp",
+    ".mp4",
+    ".webm",
+    ".mp3",
+    ".wav",
+    ".ogg",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -630,7 +646,7 @@ def create_app(
             raise HTTPException(status_code=404, detail="Media file not found")
 
         headers = {"Cache-Control": "public, max-age=31536000, immutable"}
-        if ext not in INLINE_IMAGE_EXTS:
+        if ext not in INLINE_MEDIA_EXTS:
             headers["Content-Disposition"] = f'attachment; filename="{stored_filename}"'
         return FileResponse(target, media_type=SAFE_MEDIA_MIMES[ext], headers=headers)
 

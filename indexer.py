@@ -51,6 +51,8 @@ from bitcointx.core.script import CScript
 from bitcointx.wallet import P2WPKHBitcoinAddress, P2WSHBitcoinAddress
 
 from bpub import (
+    MULTIPART_MANIFEST_MIME,
+    MULTIPART_PART_MIME,
     assemble_multipart,
     decode_pubkeys_to_stream,
     decode_stream,
@@ -317,7 +319,20 @@ def save_ownership(ownership, ownership_path: Path):
     tmp.replace(ownership_path)
 
 
-SAFE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".txt", ".bin"}
+SAFE_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".webp",
+    ".mp4",
+    ".webm",
+    ".mp3",
+    ".wav",
+    ".ogg",
+    ".txt",
+    ".bin",
+}
 MAX_BASENAME_LEN = 120
 
 
@@ -356,6 +371,16 @@ def guess_extension(mime: Optional[str], existing_name: str) -> str:
             ext = ".gif"
         elif "webp" in m:
             ext = ".webp"
+        elif m == "video/mp4" or m.startswith("video/mp4;"):
+            ext = ".mp4"
+        elif m == "video/webm" or m.startswith("video/webm;"):
+            ext = ".webm"
+        elif m == "audio/mpeg" or m == "audio/mp3":
+            ext = ".mp3"
+        elif m == "audio/wav" or m == "audio/x-wav":
+            ext = ".wav"
+        elif m == "audio/ogg" or m.startswith("audio/ogg;"):
+            ext = ".ogg"
         elif m == "text/plain" or m.startswith("text/plain;"):
             ext = ".txt"
     if not ext:
@@ -765,9 +790,10 @@ def _try_assemble_manifest_tx(
         )
         return False
 
-    if not out_path.exists():
-        with open(out_path, "wb") as f:
-            f.write(content)
+    tmp_path = out_path.with_name(out_path.name + ".tmp")
+    with open(tmp_path, "wb") as f:
+        f.write(content)
+    tmp_path.replace(out_path)
 
     try:
         funding_txids = json.loads(mrow.get("funding_txids_json") or "[]")
@@ -1056,6 +1082,126 @@ def reconcile_reorg(
     return fork_h + 1
 
 
+def migrate_existing_multipart(db: BpubDB, media_dir: Path) -> dict:
+    """
+    One-time idempotent in-place migration for databases indexed before
+    multipart v1 support existed: moves legacy `application/vnd.bpub.part` rows
+    from `items`/`media/` into `multipart_parts`/`parts/`, converts legacy
+    `application/vnd.bpub.manifest+json` rows into `multipart_manifests`, and
+    assembles every complete multipart file without rescanning the blockchain.
+    """
+    media_dir.mkdir(parents=True, exist_ok=True)
+    media_dir_resolved = media_dir.resolve()
+    parts_dir = media_dir.parent / "parts"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    parts_dir_resolved = parts_dir.resolve()
+
+    stats = {"parts_migrated": 0, "manifests_migrated": 0, "assembled": 0}
+    old_files_to_unlink: List[Path] = []
+    written_media_paths = set()
+
+    with db.transaction() as conn:
+        legacy_parts = conn.execute(
+            "SELECT txid, block_height, block_hash, stored_filename, size "
+            "FROM items WHERE mime = ?",
+            (MULTIPART_PART_MIME,),
+        ).fetchall()
+        legacy_manifests = conn.execute(
+            "SELECT txid, block_height, block_hash, block_time, stored_filename, "
+            "script_suffix, funding_txids_json FROM items WHERE mime = ?",
+            (MULTIPART_MANIFEST_MIME,),
+        ).fetchall()
+
+        if not legacy_parts and not legacy_manifests:
+            return stats
+
+        for row in legacy_parts:
+            txid = row["txid"]
+            src = (media_dir / row["stored_filename"]).resolve()
+            if src.parent != media_dir_resolved or not src.is_file():
+                continue
+            safe_txid = re.sub(r"[^0-9a-fA-F]", "", txid)[:64].lower()
+            part_fname = f"{safe_txid}.part"
+            dst = (parts_dir / part_fname).resolve()
+            if dst.parent != parts_dir_resolved:
+                continue
+            if not dst.exists():
+                tmp_dst = dst.with_name(dst.name + ".tmp")
+                tmp_dst.write_bytes(src.read_bytes())
+                tmp_dst.replace(dst)
+            db.insert_multipart_part_tx(
+                conn,
+                txid,
+                int(row["block_height"]),
+                str(row["block_hash"] or ""),
+                part_fname,
+                int(row["size"] or dst.stat().st_size),
+            )
+            conn.execute("DELETE FROM items WHERE txid = ?", (txid,))
+            old_files_to_unlink.append(src)
+            stats["parts_migrated"] += 1
+
+        for row in legacy_manifests:
+            txid = row["txid"]
+            src = (media_dir / row["stored_filename"]).resolve()
+            if src.parent != media_dir_resolved or not src.is_file():
+                continue
+            try:
+                manifest = parse_manifest(src.read_bytes())
+            except ValueError as e:
+                sys.stderr.write(
+                    f"[WARN] Skipping invalid legacy manifest {txid}: {e}\n"
+                )
+                continue
+            canonical_json = encode_manifest(manifest).decode("utf-8")
+            try:
+                funding_txids = json.loads(row["funding_txids_json"] or "[]")
+            except Exception:
+                funding_txids = []
+            db.insert_multipart_manifest_tx(
+                conn,
+                txid=txid,
+                block_height=int(row["block_height"]),
+                block_hash=str(row["block_hash"] or ""),
+                block_time=row["block_time"],
+                script_suffix=row["script_suffix"],
+                funding_txids=funding_txids,
+                manifest_json=canonical_json,
+            )
+            conn.execute("DELETE FROM items WHERE txid = ?", (txid,))
+            old_files_to_unlink.append(src)
+            stats["manifests_migrated"] += 1
+
+        for pending_m in db.list_pending_multipart_manifests_tx(conn):
+            if _try_assemble_manifest_tx(
+                conn,
+                db,
+                media_dir,
+                media_dir_resolved,
+                parts_dir,
+                parts_dir_resolved,
+                pending_m,
+            ):
+                stats["assembled"] += 1
+                irow = conn.execute(
+                    "SELECT stored_filename FROM items WHERE txid = ?",
+                    (pending_m["txid"],),
+                ).fetchone()
+                if irow is not None:
+                    written_media_paths.add((media_dir / irow["stored_filename"]).resolve())
+
+    for old_path in old_files_to_unlink:
+        if old_path in written_media_paths:
+            continue
+        try:
+            if old_path.is_file():
+                old_path.unlink()
+        except OSError:
+            pass
+
+    return stats
+
+
 def main():
     config = load_config()
     rpc = make_rpc(config)
@@ -1071,6 +1217,11 @@ def main():
     if any(migrated.values()):
         sys.stderr.write(
             f"[INFO] Migrated legacy JSON files into {db_path}: {migrated}\n"
+        )
+    mp_migrated = migrate_existing_multipart(db, media_dir)
+    if any(mp_migrated.values()):
+        sys.stderr.write(
+            f"[INFO] Migrated existing multipart records in-place: {mp_migrated}\n"
         )
 
     current_height = db.get_next_height(config["start_height"])

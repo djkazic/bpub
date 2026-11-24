@@ -640,7 +640,9 @@ def decode_stream(payload: bytes):
 MULTIPART_MANIFEST_MIME = "application/vnd.bpub.manifest+json"
 MULTIPART_PART_MIME = "application/vnd.bpub.part"
 MULTIPART_MANIFEST_VERSION = 1
-MAX_MULTIPART_PARTS = 100
+MAX_MULTIPART_PARTS = 1000
+# Hard cap on reassembled multipart files (real mainnet MP4s reach ~25 MiB / 197 parts)
+MAX_MULTIPART_ASSEMBLED_BYTES = 128 * 1024 * 1024
 # 630 padv3 scripts * 10 data pubkeys * 31 bytes = 195,300 bytes (< 400k WU reveal)
 DEFAULT_MULTIPART_MAX_STREAM_BYTES = 195_000
 
@@ -802,9 +804,9 @@ def parse_manifest(content: bytes) -> dict:
     size = obj.get("size")
     if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
         raise ValueError("manifest size must be a positive integer")
-    if size > MAX_CONTENT_DECOMPRESSED_BYTES:
+    if size > MAX_MULTIPART_ASSEMBLED_BYTES:
         raise ValueError(
-            f"manifest size exceeds limit ({size} > {MAX_CONTENT_DECOMPRESSED_BYTES})"
+            f"manifest size exceeds limit ({size} > {MAX_MULTIPART_ASSEMBLED_BYTES})"
         )
 
     sha_raw = obj.get("sha256")
@@ -856,12 +858,13 @@ def assemble_multipart(manifest: dict, part_contents) -> bytes:
         raise ValueError(f"expected {len(expected_parts)} parts, got {len(contents)}")
 
     joined = b"".join(contents)
+    max_allowed = min(MAX_MULTIPART_ASSEMBLED_BYTES, max(int(manifest["size"]), 1))
     if manifest["compression"] == "deflate-raw":
-        content = _raw_inflate(joined, max_bytes=MAX_CONTENT_DECOMPRESSED_BYTES)
+        content = _raw_inflate(joined, max_bytes=max_allowed)
     elif manifest["compression"] == "none":
-        if len(joined) > MAX_CONTENT_DECOMPRESSED_BYTES:
+        if len(joined) > MAX_MULTIPART_ASSEMBLED_BYTES:
             raise ValueError(
-                f"reassembled file exceeds limit ({len(joined)} > {MAX_CONTENT_DECOMPRESSED_BYTES})"
+                f"reassembled file exceeds limit ({len(joined)} > {MAX_MULTIPART_ASSEMBLED_BYTES})"
             )
         content = joined
     else:

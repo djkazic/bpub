@@ -211,7 +211,7 @@ class MultipartProtocolTest(unittest.TestCase):
             enc({**valid, "parts": ["not-a-txid"]}),
             enc({**valid, "size": 0}),
             enc({**valid, "size": True}),
-            enc({**valid, "size": bpub.MAX_CONTENT_DECOMPRESSED_BYTES + 1}),
+            enc({**valid, "size": bpub.MAX_MULTIPART_ASSEMBLED_BYTES + 1}),
             enc({**valid, "sha256": "zz" * 32}),
         ]:
             with self.assertRaises(ValueError):
@@ -298,6 +298,86 @@ class MultipartIndexerTest(unittest.TestCase):
             )
             self.assertEqual(rev2_again, 1)
             self.assertIsNotNone(db.get_item_by_txid(mtxid))
+
+    def test_migrate_existing_multipart_in_place(self):
+        data = _noise(4_800, seed=99)
+        plan = bpub.plan_multipart(data, max_stream_bytes=2_000)
+        part_txids = [f"{(i + 1):064x}" for i in range(len(plan["parts"]))]
+        manifest_txid = "ee" * 32
+        manifest = bpub.build_manifest(
+            plan, part_txids, mime="video/mp4", filename="demo.mp4"
+        )
+        manifest_bytes = bpub.encode_manifest(manifest)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            gdir = Path(tmp)
+            media_dir = gdir / "media"
+            media_dir.mkdir(parents=True, exist_ok=True)
+            db = BpubDB(gdir / "bpub.db")
+
+            # Seed DB as if the old pre-multipart indexer had stored raw parts + manifest in `items`.
+            with db.transaction() as conn:
+                for ptxid, pbytes in zip(part_txids, plan["parts"]):
+                    sf = f"{ptxid}_file.bin"
+                    (media_dir / sf).write_bytes(pbytes)
+                    db.insert_item_tx(
+                        conn,
+                        {
+                            "txid": ptxid,
+                            "block_height": 975475,
+                            "block_hash": "11" * 32,
+                            "time": 1700000000,
+                            "filename": None,
+                            "stored_filename": sf,
+                            "mime": bpub.MULTIPART_PART_MIME,
+                            "size": len(pbytes),
+                            "bpub_version": 5,
+                            "script_suffix": "padv3",
+                            "bpub_id": bpub.compute_bpub_v5_id(pbytes).hex(),
+                            "funding_txids": [],
+                        },
+                    )
+                msf = f"{manifest_txid}_file.bin"
+                (media_dir / msf).write_bytes(manifest_bytes)
+                db.insert_item_tx(
+                    conn,
+                    {
+                        "txid": manifest_txid,
+                        "block_height": 975476,
+                        "block_hash": "22" * 32,
+                        "time": 1700000100,
+                        "filename": None,
+                        "stored_filename": msf,
+                        "mime": bpub.MULTIPART_MANIFEST_MIME,
+                        "size": len(manifest_bytes),
+                        "bpub_version": 5,
+                        "script_suffix": "padv3",
+                        "bpub_id": bpub.compute_bpub_v5_id(manifest_bytes).hex(),
+                        "funding_txids": ["ff" * 32],
+                    },
+                )
+
+            st = indexer.migrate_existing_multipart(db, media_dir)
+            self.assertEqual(st["parts_migrated"], len(part_txids))
+            self.assertEqual(st["manifests_migrated"], 1)
+            self.assertEqual(st["assembled"], 1)
+
+            # Second run must be a no-op (idempotent).
+            st2 = indexer.migrate_existing_multipart(db, media_dir)
+            self.assertEqual(st2, {"parts_migrated": 0, "manifests_migrated": 0, "assembled": 0})
+
+            items, total = db.list_items()
+            self.assertEqual(total, 1)
+            item = db.get_item_by_txid(manifest_txid)
+            self.assertIsNotNone(item)
+            self.assertEqual(item["mime"], "video/mp4")
+            self.assertTrue(item["stored_filename"].endswith(".mp4"))
+            self.assertEqual(item["parts_count"], len(part_txids))
+            self.assertEqual(item["bpub_id"], bpub.compute_bpub_v5_id(data).hex())
+            self.assertEqual((media_dir / item["stored_filename"]).read_bytes(), data)
+            # Legacy part .bin files removed from media/ and moved to parts/.
+            self.assertFalse((media_dir / f"{part_txids[0]}_file.bin").exists())
+            self.assertTrue((gdir / "parts" / f"{part_txids[0]}.part").is_file())
 
 
 class MultipartCustodialOrderTest(unittest.TestCase):

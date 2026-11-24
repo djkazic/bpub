@@ -326,11 +326,18 @@ input:focus, select:focus, textarea:focus {
   overflow: hidden;
 }
 
-.modal-media img {
+.modal-media img,
+.modal-media video {
   max-width: 100%;
   max-height: 460px;
   display: block;
   margin: 0 auto;
+}
+
+.modal-media audio {
+  width: 100%;
+  display: block;
+  padding: 0.75rem;
 }
 
 .kv {

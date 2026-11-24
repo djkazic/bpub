@@ -1,5 +1,7 @@
 (() => {
   const SAFE_IMG_EXTS = ['.jpg', '.jpeg', '.png', '.gif', '.webp'];
+  const SAFE_VIDEO_EXTS = ['.mp4', '.webm'];
+  const SAFE_AUDIO_EXTS = ['.mp3', '.wav', '.ogg'];
   const PAGE_SIZE = 24;
   const MAX_TEXT_PREVIEW_BYTES = 32 * 1024;
 
@@ -29,6 +31,18 @@
     if (typeof name !== 'string') return false;
     const lower = name.toLowerCase();
     return SAFE_IMG_EXTS.some((ext) => lower.endsWith(ext));
+  }
+
+  function isSafeVideo(name) {
+    if (typeof name !== 'string') return false;
+    const lower = name.toLowerCase();
+    return SAFE_VIDEO_EXTS.some((ext) => lower.endsWith(ext));
+  }
+
+  function isSafeAudio(name) {
+    if (typeof name !== 'string') return false;
+    const lower = name.toLowerCase();
+    return SAFE_AUDIO_EXTS.some((ext) => lower.endsWith(ext));
   }
 
   function isTextPreviewable(item) {
@@ -195,7 +209,12 @@
       } else {
         const ph = document.createElement('div');
         ph.className = 'file-placeholder';
-        ph.textContent = item.mime || 'application/octet-stream';
+        const prefix = isSafeVideo(item.stored_filename)
+          ? '▶ Video · '
+          : isSafeAudio(item.stored_filename)
+            ? '♪ Audio · '
+            : '';
+        ph.textContent = prefix + (item.mime || 'application/octet-stream');
         mediaBox.appendChild(ph);
       }
 
@@ -302,6 +321,21 @@
         img.src = url;
         img.alt = item.filename || item.txid;
         media.appendChild(img);
+        body.appendChild(media);
+      } else if (isSafeVideo(item.stored_filename)) {
+        const vid = document.createElement('video');
+        vid.src = url;
+        vid.controls = true;
+        vid.preload = 'metadata';
+        vid.playsInline = true;
+        media.appendChild(vid);
+        body.appendChild(media);
+      } else if (isSafeAudio(item.stored_filename)) {
+        const aud = document.createElement('audio');
+        aud.src = url;
+        aud.controls = true;
+        aud.preload = 'metadata';
+        media.appendChild(aud);
         body.appendChild(media);
       } else if (isTextPreviewable(item) && (item.size || 0) <= MAX_TEXT_PREVIEW_BYTES) {
         const pre = document.createElement('pre');
