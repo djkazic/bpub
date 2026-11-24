@@ -634,6 +634,275 @@ def decode_stream(payload: bytes):
 
 
 # ---------------------------------------------------------------------------
+# MULTIPART FILES (v1 — wire-compatible with @bitfiles/bpub)
+# ---------------------------------------------------------------------------
+
+MULTIPART_MANIFEST_MIME = "application/vnd.bpub.manifest+json"
+MULTIPART_PART_MIME = "application/vnd.bpub.part"
+MULTIPART_MANIFEST_VERSION = 1
+MAX_MULTIPART_PARTS = 100
+# 630 padv3 scripts * 10 data pubkeys * 31 bytes = 195,300 bytes (< 400k WU reveal)
+DEFAULT_MULTIPART_MAX_STREAM_BYTES = 195_000
+
+_V5_FIXED_OVERHEAD = 4 + 1 + 1 + 8 + 32 + 2
+_PART_META_GUESS = 120
+
+
+def is_manifest_meta(meta: dict) -> bool:
+    """Return True when recovered BPUB metadata marks a multipart manifest."""
+    return isinstance(meta, dict) and meta.get("mime") == MULTIPART_MANIFEST_MIME
+
+
+def is_part_meta(meta: dict) -> bool:
+    """Return True when recovered BPUB metadata marks one part of a multipart file."""
+    return isinstance(meta, dict) and meta.get("mime") == MULTIPART_PART_MIME
+
+
+def _normalize_txid(txid: str) -> str:
+    if not isinstance(txid, str):
+        raise ValueError(f"not a txid: {txid!r}")
+    clean = txid.strip().lower()
+    if len(clean) != 64:
+        raise ValueError(f"not a txid: {txid!r}")
+    try:
+        bytes.fromhex(clean)
+    except ValueError:
+        raise ValueError(f"not a txid: {txid!r}") from None
+    return clean
+
+
+def plan_multipart(
+    data: bytes,
+    max_stream_bytes: int = DEFAULT_MULTIPART_MAX_STREAM_BYTES,
+    compress="auto",
+) -> dict:
+    """
+    Split a file into parts whose BPUB v5 streams each fit within
+    `max_stream_bytes` (with mime=MULTIPART_PART_MIME, compress=False).
+
+    The whole file is optionally raw-DEFLATE compressed once before slicing
+    (`compress="auto"` keeps the compressed form only when strictly smaller;
+    `compress=True` forces deflate-raw; `compress=False` disables compression).
+    """
+    if (
+        isinstance(max_stream_bytes, bool)
+        or not isinstance(max_stream_bytes, int)
+        or max_stream_bytes <= _V5_FIXED_OVERHEAD + _PART_META_GUESS
+    ):
+        raise ValueError(
+            f"max_stream_bytes must be an integer above {_V5_FIXED_OVERHEAD + _PART_META_GUESS}"
+        )
+    if not data:
+        raise ValueError("cannot split an empty file")
+    if compress not in ("auto", True, False):
+        raise ValueError(f"invalid compress option: {compress!r}")
+
+    payload = data
+    compression = "none"
+    if compress is not False:
+        packed = _raw_deflate(data)
+        if compress is True or len(packed) < len(data):
+            payload = packed
+            compression = "deflate-raw"
+
+    parts = []
+    offset = 0
+    total_len = len(payload)
+    while offset < total_len:
+        length = min(total_len - offset, max_stream_bytes - _V5_FIXED_OVERHEAD - _PART_META_GUESS)
+        while True:
+            if length <= 0:
+                raise ValueError("max_stream_bytes too small to fit a v5 part stream")
+            part_slice = payload[offset : offset + length]
+            stream = build_stream_v5(part_slice, MULTIPART_PART_MIME, "", compress=False)
+            over = len(stream) - max_stream_bytes
+            if over <= 0:
+                parts.append(part_slice)
+                break
+            length -= over
+        offset += length
+
+    if len(parts) > MAX_MULTIPART_PARTS:
+        raise ValueError(
+            f"multipart plan requires {len(parts)} parts (max {MAX_MULTIPART_PARTS})"
+        )
+
+    return {
+        "size": len(data),
+        "sha256": hashlib.sha256(data).digest(),
+        "bpub_id": compute_bpub_v5_id(data),
+        "compression": compression,
+        "parts": parts,
+    }
+
+
+def build_manifest(
+    plan: dict,
+    part_txids,
+    mime: str = "",
+    filename: str = "",
+) -> dict:
+    """Pair a multipart plan with the txids its parts were inscribed under, in order."""
+    parts = plan.get("parts") or []
+    txids = list(part_txids)
+    if len(txids) != len(parts):
+        raise ValueError(f"expected {len(parts)} part txids, got {len(txids)}")
+    if not txids or len(txids) > MAX_MULTIPART_PARTS:
+        raise ValueError(f"part count must be between 1 and {MAX_MULTIPART_PARTS}")
+
+    manifest = {
+        "version": MULTIPART_MANIFEST_VERSION,
+        "size": int(plan["size"]),
+        "sha256": bytes(plan["sha256"]),
+        "compression": str(plan["compression"]),
+        "parts": [_normalize_txid(t) for t in txids],
+    }
+    if isinstance(mime, str) and mime:
+        manifest["mime"] = mime
+    if isinstance(filename, str) and filename:
+        manifest["filename"] = filename
+    return manifest
+
+
+def encode_manifest(manifest: dict) -> bytes:
+    """
+    Serialize a multipart manifest to canonical compact UTF-8 JSON bytes
+    (fixed key order matching @bitfiles/bpub).
+    """
+    obj = {"bpub_manifest": int(manifest["version"])}
+    if manifest.get("mime"):
+        obj["mime"] = str(manifest["mime"])
+    if manifest.get("filename"):
+        obj["filename"] = str(manifest["filename"])
+    obj["size"] = int(manifest["size"])
+    sha = manifest["sha256"]
+    obj["sha256"] = sha.hex() if isinstance(sha, (bytes, bytearray)) else str(sha).lower()
+    obj["compression"] = str(manifest["compression"])
+    obj["parts"] = [_normalize_txid(t) for t in manifest["parts"]]
+    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def parse_manifest(content: bytes) -> dict:
+    """Parse and strictly validate multipart manifest JSON bytes."""
+    try:
+        obj = json.loads(content.decode("utf-8"))
+    except Exception as e:
+        raise ValueError(f"manifest is not valid JSON: {e}") from None
+    if not isinstance(obj, dict):
+        raise ValueError("manifest is not a JSON object")
+
+    version = obj.get("bpub_manifest")
+    if isinstance(version, bool) or version != MULTIPART_MANIFEST_VERSION:
+        raise ValueError(f"unsupported manifest version: {version!r}")
+
+    compression = obj.get("compression")
+    if compression not in ("none", "deflate-raw"):
+        raise ValueError(f"unsupported manifest compression: {compression!r}")
+
+    size = obj.get("size")
+    if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+        raise ValueError("manifest size must be a positive integer")
+    if size > MAX_CONTENT_DECOMPRESSED_BYTES:
+        raise ValueError(
+            f"manifest size exceeds limit ({size} > {MAX_CONTENT_DECOMPRESSED_BYTES})"
+        )
+
+    sha_raw = obj.get("sha256")
+    if not isinstance(sha_raw, str) or len(sha_raw) != 64:
+        raise ValueError("manifest sha256 must be a 64-character hex SHA-256")
+    try:
+        sha_bytes = bytes.fromhex(sha_raw)
+    except ValueError:
+        raise ValueError("manifest sha256 must be a 64-character hex SHA-256") from None
+
+    raw_parts = obj.get("parts")
+    if not isinstance(raw_parts, list) or len(raw_parts) == 0:
+        raise ValueError("manifest has no parts")
+    if len(raw_parts) > MAX_MULTIPART_PARTS:
+        raise ValueError(
+            f"manifest has too many parts ({len(raw_parts)} > {MAX_MULTIPART_PARTS})"
+        )
+    parts = []
+    for idx, txid in enumerate(raw_parts):
+        try:
+            parts.append(_normalize_txid(txid))
+        except ValueError:
+            raise ValueError(f"manifest part {idx} is not a txid") from None
+
+    manifest = {
+        "version": version,
+        "size": size,
+        "sha256": sha_bytes,
+        "compression": compression,
+        "parts": parts,
+    }
+    mime = obj.get("mime")
+    if isinstance(mime, str) and mime:
+        manifest["mime"] = mime
+    filename = obj.get("filename")
+    if isinstance(filename, str) and filename:
+        manifest["filename"] = filename
+    return manifest
+
+
+def assemble_multipart(manifest: dict, part_contents) -> bytes:
+    """
+    Reassemble a multipart file from its parts' contents in manifest order,
+    enforcing bounded decompression and verifying exact size and SHA-256.
+    """
+    contents = list(part_contents)
+    expected_parts = manifest["parts"]
+    if len(contents) != len(expected_parts):
+        raise ValueError(f"expected {len(expected_parts)} parts, got {len(contents)}")
+
+    joined = b"".join(contents)
+    if manifest["compression"] == "deflate-raw":
+        content = _raw_inflate(joined, max_bytes=MAX_CONTENT_DECOMPRESSED_BYTES)
+    elif manifest["compression"] == "none":
+        if len(joined) > MAX_CONTENT_DECOMPRESSED_BYTES:
+            raise ValueError(
+                f"reassembled file exceeds limit ({len(joined)} > {MAX_CONTENT_DECOMPRESSED_BYTES})"
+            )
+        content = joined
+    else:
+        raise ValueError(f"unsupported manifest compression: {manifest['compression']!r}")
+
+    if len(content) != manifest["size"]:
+        raise ValueError(
+            f"reassembled file is {len(content)} bytes; the manifest says {manifest['size']}"
+        )
+    sha_expected = manifest["sha256"]
+    if isinstance(sha_expected, str):
+        sha_expected = bytes.fromhex(sha_expected)
+    if hashlib.sha256(content).digest() != sha_expected:
+        raise ValueError("SHA-256 mismatch in the reassembled file")
+    return content
+
+
+def manifest_file_meta(manifest: dict) -> dict:
+    """
+    Build BPUB v5 metadata for a reassembled multipart file, deriving the same
+    canonical v5 `bpub_id` it would have had as a single-transaction inscription.
+    """
+    sha_bytes = manifest["sha256"]
+    if isinstance(sha_bytes, str):
+        sha_bytes = bytes.fromhex(sha_bytes)
+    size = int(manifest["size"])
+    bpub_id = hashlib.sha256(b"BPUB5" + sha_bytes + size.to_bytes(8, "big")).digest()
+    meta = {
+        "bpub_version": 5,
+        "size": size,
+        "sha": sha_bytes,
+        "bpub_id": bpub_id,
+    }
+    if manifest.get("mime"):
+        meta["mime"] = manifest["mime"]
+    if manifest.get("filename"):
+        meta["filename"] = manifest["filename"]
+    return meta
+
+
+# ---------------------------------------------------------------------------
 # MULTISIG SCRIPT CONSTRUCTION
 # ---------------------------------------------------------------------------
 

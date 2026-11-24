@@ -161,6 +161,48 @@ To reveal the data, each multisig output must be spent. The script is recovered
 from the witness, data pubkeys are extracted, decoded, and reassembled into the
 BPUB stream. Once reconstructed, the original file can be recovered.
 
+---
+
+## Multipart Files (v1)
+
+A single `padv3` reveal transaction must stay within the 400,000 WU standardness
+limit (~195 KiB of encoded BPUB stream across 630 1-of-11 scripts). Files larger
+than a single reveal transaction are split across **part** inscriptions and tied
+together by a **manifest** inscription whose txid acts as the file's canonical
+link. Both are ordinary BPUB v5 inscriptions, so the underlying stream format is
+unchanged and wire-compatible with `@bitfiles/bpub`.
+
+- **Whole-file compression:** The original file is optionally raw-DEFLATE
+  compressed once (`"deflate-raw"` when smaller, otherwise `"none"`), then
+  sliced so each part's v5 stream fits within the target stream budget.
+- **Part inscriptions:** Inscribed as BPUB v5 with
+  `mime = "application/vnd.bpub.part"` and `compress = false` (no per-part
+  stream compression). Indexers store parts privately and hide them from
+  top-level gallery listings.
+- **Manifest inscription:** Inscribed as BPUB v5 with
+  `mime = "application/vnd.bpub.manifest+json"` and `compress = true`, carrying
+  canonical UTF-8 JSON:
+
+```json
+{
+  "bpub_manifest": 1,
+  "mime": "image/png",
+  "filename": "large.png",
+  "size": 524288,
+  "sha256": "<64-hex sha256 of the reassembled uncompressed file>",
+  "compression": "deflate-raw",
+  "parts": ["<part0_txid>", "<part1_txid>", "<part2_txid>"]
+}
+```
+
+- **Canonical `bpub_id`:** Reassembled multipart files derive their v5
+  `bpub_id = sha256("BPUB5" || sha256 || size_be_8)` from the manifest's
+  `sha256` and `size`, producing the exact same `bpub_id` as a single-tx v5
+  inscription.
+- **Verification:** Readers join part contents in manifest order, inflate with a
+  hard decompression bound when `compression == "deflate-raw"`, and require an
+  exact match on both `size` and `sha256`.
+
 ## Legacy Versions
 * v3.5: TLV header with "BPUB" magic and cleartext metadata.
 

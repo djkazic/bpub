@@ -51,10 +51,16 @@ from bitcointx.core.script import CScript
 from bitcointx.wallet import P2WPKHBitcoinAddress, P2WSHBitcoinAddress
 
 from bpub import (
+    assemble_multipart,
     decode_pubkeys_to_stream,
     decode_stream,
     decode_owner_redeem_script,
+    encode_manifest,
+    is_manifest_meta,
+    is_part_meta,
+    manifest_file_meta,
     parse_bpub_multisig,
+    parse_manifest,
 )
 from db import BpubDB
 
@@ -697,23 +703,125 @@ def save_state(state_path: Path, next_height: int):
     tmp.replace(state_path)
 
 
+def _try_assemble_manifest_tx(
+    conn,
+    db: BpubDB,
+    media_dir: Path,
+    media_dir_resolved: Path,
+    parts_dir: Path,
+    parts_dir_resolved: Path,
+    mrow: dict,
+) -> bool:
+    """
+    Attempt to assemble a stored multipart manifest if all its referenced part
+    inscriptions are present in `multipart_parts`. Returns True if newly
+    assembled and inserted into `items`.
+    """
+    manifest_txid = mrow["txid"]
+    if db.has_item_tx(conn, manifest_txid):
+        db.mark_multipart_manifest_assembled_tx(conn, manifest_txid)
+        return False
+
+    try:
+        manifest = parse_manifest(mrow["manifest_json"].encode("utf-8"))
+    except Exception as e:
+        sys.stderr.write(f"[WARN] Corrupt stored manifest {manifest_txid}: {e}\n")
+        return False
+
+    part_txids = manifest["parts"]
+    found_parts = db.get_multipart_parts_tx(conn, part_txids)
+    if len(found_parts) < len(set(part_txids)):
+        return False
+
+    part_contents: List[bytes] = []
+    for ptxid in part_txids:
+        prec = found_parts.get(ptxid)
+        if prec is None:
+            return False
+        ppath = (parts_dir / prec["stored_path"]).resolve()
+        if ppath.parent != parts_dir_resolved or not ppath.is_file():
+            return False
+        part_contents.append(ppath.read_bytes())
+
+    try:
+        content = assemble_multipart(manifest, part_contents)
+    except Exception as e:
+        sys.stderr.write(
+            f"[WARN] Failed assembling multipart manifest {manifest_txid}: {e}\n"
+        )
+        return False
+
+    file_meta = manifest_file_meta(manifest)
+    filename_meta = file_meta.get("filename")
+    mime = file_meta.get("mime")
+    size = file_meta["size"]
+    bpub_id_hex = file_meta["bpub_id"].hex()
+
+    stored_name = make_stored_filename(manifest_txid, filename_meta, mime)
+    out_path = (media_dir / stored_name).resolve()
+    if out_path.parent != media_dir_resolved:
+        sys.stderr.write(
+            f"[WARN] Refusing unsafe output path for multipart manifest {manifest_txid}\n"
+        )
+        return False
+
+    if not out_path.exists():
+        with open(out_path, "wb") as f:
+            f.write(content)
+
+    try:
+        funding_txids = json.loads(mrow.get("funding_txids_json") or "[]")
+    except Exception:
+        funding_txids = []
+
+    entry = {
+        "txid": manifest_txid,
+        "block_height": int(mrow["block_height"]),
+        "block_hash": str(mrow.get("block_hash") or ""),
+        "time": mrow.get("block_time"),
+        "filename": filename_meta if isinstance(filename_meta, str) else None,
+        "stored_filename": stored_name,
+        "mime": mime,
+        "size": size,
+        "bpub_version": 5,
+        "script_suffix": mrow.get("script_suffix"),
+        "bpub_id": bpub_id_hex,
+        "funding_txids": funding_txids,
+        "parts_count": len(part_txids),
+    }
+
+    inserted = db.insert_item_tx(conn, entry)
+    db.register_genesis_tx(conn, bpub_id_hex, funding_txids)
+    db.mark_multipart_manifest_assembled_tx(conn, manifest_txid)
+    sys.stderr.write(
+        f"[FOUND] BPUB v5 multipart file in tx {manifest_txid}: "
+        f"{stored_name} ({size} bytes, {len(part_txids)} parts, mime={mime})\n"
+    )
+    return inserted
+
+
 def index_block(db: BpubDB, media_dir: Path, block: dict, height: int) -> Tuple[int, int]:
     """
-    Scan a single verbosity-2 block dict and persist all BPUB reveals,
-    verified v5 ownership updates, and the updated next_height atomically in
-    SQLite. Returns (reveals_indexed, owner_updates_applied).
+    Scan a single verbosity-2 block dict and persist all BPUB reveals
+    (including multipart v1 parts & manifests), verified v5 ownership updates,
+    and the updated next_height atomically in SQLite. Returns
+    (reveals_indexed, owner_updates_applied).
     """
     blockhash = str(block.get("hash") or "")
     block_time = block.get("time", None)
     txs = block.get("tx", [])
     media_dir.mkdir(parents=True, exist_ok=True)
     media_dir_resolved = media_dir.resolve()
+    parts_dir = media_dir.parent / "parts"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    parts_dir_resolved = parts_dir.resolve()
 
     reveals_count = 0
     owners_count = 0
 
     with db.transaction() as conn:
-        # Pass 1: extract BPUB reveals and anchor v5 genesis ownership.
+        # Pass 1: extract BPUB reveals (single, multipart parts, multipart manifests)
+        # and anchor v5 genesis ownership.
         for tx in txs:
             txid = tx.get("txid")
             raw_hex = tx.get("hex")
@@ -721,7 +829,11 @@ def index_block(db: BpubDB, media_dir: Path, block: dict, height: int) -> Tuple[
                 continue
             if not _tx_maybe_bpub_reveal(tx):
                 continue
-            if db.has_item_tx(conn, txid):
+            if (
+                db.has_item_tx(conn, txid)
+                or db.has_multipart_part_tx(conn, txid)
+                or db.has_multipart_manifest_tx(conn, txid)
+            ):
                 continue
 
             try:
@@ -730,6 +842,81 @@ def index_block(db: BpubDB, media_dir: Path, block: dict, height: int) -> Tuple[
                     continue
 
                 meta, content = res
+
+                # Multipart part inscription: store privately outside media/ so
+                # raw parts never appear as gallery items, then try assembling
+                # any waiting manifests that reference this part.
+                if is_part_meta(meta):
+                    safe_txid = re.sub(r"[^0-9a-fA-F]", "", txid)[:64].lower()
+                    part_fname = f"{safe_txid}.part"
+                    part_path = (parts_dir / part_fname).resolve()
+                    if part_path.parent != parts_dir_resolved:
+                        sys.stderr.write(
+                            f"[WARN] Refusing unsafe part path for tx {txid}\n"
+                        )
+                        continue
+                    if not part_path.exists():
+                        with open(part_path, "wb") as f:
+                            f.write(content)
+                    db.insert_multipart_part_tx(
+                        conn, txid, height, blockhash, part_fname, len(content)
+                    )
+                    for pending_m in db.list_pending_multipart_manifests_tx(conn):
+                        if _try_assemble_manifest_tx(
+                            conn,
+                            db,
+                            media_dir,
+                            media_dir_resolved,
+                            parts_dir,
+                            parts_dir_resolved,
+                            pending_m,
+                        ):
+                            reveals_count += 1
+                    continue
+
+                # Multipart manifest inscription: validate schema, persist, and
+                # assemble immediately if all parts are already indexed.
+                if is_manifest_meta(meta):
+                    try:
+                        manifest = parse_manifest(content)
+                    except ValueError as e:
+                        sys.stderr.write(
+                            f"[WARN] Ignoring invalid multipart manifest in tx {txid}: {e}\n"
+                        )
+                        continue
+                    canonical_json = encode_manifest(manifest).decode("utf-8")
+                    funding_txids = meta.get("funding_txids", [])
+                    db.insert_multipart_manifest_tx(
+                        conn,
+                        txid=txid,
+                        block_height=height,
+                        block_hash=blockhash,
+                        block_time=block_time,
+                        script_suffix=meta.get("script_suffix"),
+                        funding_txids=funding_txids,
+                        manifest_json=canonical_json,
+                    )
+                    mrow = {
+                        "txid": txid,
+                        "block_height": height,
+                        "block_hash": blockhash,
+                        "block_time": block_time,
+                        "script_suffix": meta.get("script_suffix"),
+                        "funding_txids_json": json.dumps(funding_txids),
+                        "manifest_json": canonical_json,
+                    }
+                    if _try_assemble_manifest_tx(
+                        conn,
+                        db,
+                        media_dir,
+                        media_dir_resolved,
+                        parts_dir,
+                        parts_dir_resolved,
+                        mrow,
+                    ):
+                        reveals_count += 1
+                    continue
+
                 filename_meta = meta.get("filename")
                 mime = meta.get("mime") if isinstance(meta.get("mime"), str) else None
                 size = meta.get("size")

@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS items (
     script_suffix TEXT,
     bpub_id TEXT,
     funding_txids_json TEXT,
+    parts_count INTEGER,
     indexed_at INTEGER NOT NULL
 );
 
@@ -42,6 +43,25 @@ CREATE INDEX IF NOT EXISTS idx_items_bpub_id
     ON items (bpub_id);
 CREATE INDEX IF NOT EXISTS idx_items_mime
     ON items (mime);
+
+CREATE TABLE IF NOT EXISTS multipart_parts (
+    txid TEXT PRIMARY KEY,
+    block_height INTEGER NOT NULL,
+    block_hash TEXT NOT NULL,
+    stored_path TEXT NOT NULL,
+    size INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS multipart_manifests (
+    txid TEXT PRIMARY KEY,
+    block_height INTEGER NOT NULL,
+    block_hash TEXT NOT NULL,
+    block_time INTEGER,
+    script_suffix TEXT,
+    funding_txids_json TEXT,
+    manifest_json TEXT NOT NULL,
+    assembled INTEGER NOT NULL DEFAULT 0
+);
 
 CREATE TABLE IF NOT EXISTS ownership (
     bpub_id TEXT PRIMARY KEY,
@@ -95,6 +115,7 @@ CREATE TABLE IF NOT EXISTS orders (
     payload_path TEXT,
     bpub_id TEXT NOT NULL,
     data_outputs_count INTEGER NOT NULL,
+    parts_count INTEGER NOT NULL DEFAULT 1,
     feerate_sat_vb INTEGER NOT NULL,
     est_onchain_sats INTEGER NOT NULL,
     upfront_funding_sats INTEGER NOT NULL DEFAULT 0,
@@ -107,6 +128,7 @@ CREATE TABLE IF NOT EXISTS orders (
     reveal_txid TEXT,
     reveal_raw_hex TEXT,
     needs_funding_conf INTEGER NOT NULL DEFAULT 0,
+    multipart_state_json TEXT,
     error_message TEXT
 );
 
@@ -146,14 +168,25 @@ class BpubDB:
         conn = _connect(self.db_path, readonly=False)
         try:
             conn.executescript(SCHEMA_SQL)
-            # Safe live migration for existing SQLite DBs missing newer columns.
-            cols = {
+            # Safe live migrations for existing SQLite DBs missing newer columns.
+            item_cols = {
+                r["name"] for r in conn.execute("PRAGMA table_info(items)").fetchall()
+            }
+            if "parts_count" not in item_cols:
+                conn.execute("ALTER TABLE items ADD COLUMN parts_count INTEGER")
+            order_cols = {
                 r["name"] for r in conn.execute("PRAGMA table_info(orders)").fetchall()
             }
-            if "upfront_funding_sats" not in cols:
+            if "upfront_funding_sats" not in order_cols:
                 conn.execute(
                     "ALTER TABLE orders ADD COLUMN upfront_funding_sats INTEGER NOT NULL DEFAULT 0"
                 )
+            if "parts_count" not in order_cols:
+                conn.execute(
+                    "ALTER TABLE orders ADD COLUMN parts_count INTEGER NOT NULL DEFAULT 1"
+                )
+            if "multipart_state_json" not in order_cols:
+                conn.execute("ALTER TABLE orders ADD COLUMN multipart_state_json TEXT")
             conn.commit()
         finally:
             conn.close()
@@ -232,6 +265,7 @@ class BpubDB:
         Rebuilds `ownership` cleanly from remaining items and ownership_history.
         """
         orphan_files: List[str] = []
+        orphan_parts: List[str] = []
         with self.transaction() as conn:
             rows = conn.execute(
                 "SELECT stored_filename FROM items WHERE block_height > ?",
@@ -239,9 +273,49 @@ class BpubDB:
             ).fetchall()
             candidate_files = {r["stored_filename"] for r in rows if r["stored_filename"]}
 
+            part_rows = conn.execute(
+                "SELECT txid, stored_path FROM multipart_parts WHERE block_height > ?",
+                (int(fork_height),),
+            ).fetchall()
+            removed_part_txids = {r["txid"] for r in part_rows}
+            orphan_parts = sorted({r["stored_path"] for r in part_rows if r["stored_path"]})
+
             del_items = conn.execute(
                 "DELETE FROM items WHERE block_height > ?", (int(fork_height),)
             ).rowcount
+            del_parts = conn.execute(
+                "DELETE FROM multipart_parts WHERE block_height > ?", (int(fork_height),)
+            ).rowcount
+            del_manifests = conn.execute(
+                "DELETE FROM multipart_manifests WHERE block_height > ?", (int(fork_height),)
+            ).rowcount
+
+            # If a surviving manifest (block_height <= fork_height) depended on a rolled-back
+            # part (out-of-order confirmation), revert it to unassembled and remove its item.
+            if removed_part_txids:
+                for mrow in conn.execute(
+                    "SELECT txid, manifest_json FROM multipart_manifests WHERE assembled = 1"
+                ).fetchall():
+                    try:
+                        mobj = json.loads(mrow["manifest_json"])
+                        mparts = set(mobj.get("parts") or [])
+                    except Exception:
+                        mparts = set()
+                    if mparts & removed_part_txids:
+                        conn.execute(
+                            "UPDATE multipart_manifests SET assembled = 0 WHERE txid = ?",
+                            (mrow["txid"],),
+                        )
+                        irow = conn.execute(
+                            "SELECT stored_filename FROM items WHERE txid = ?",
+                            (mrow["txid"],),
+                        ).fetchone()
+                        if irow is not None and irow["stored_filename"]:
+                            candidate_files.add(irow["stored_filename"])
+                        del_items += conn.execute(
+                            "DELETE FROM items WHERE txid = ?", (mrow["txid"],)
+                        ).rowcount
+
             del_hist = conn.execute(
                 "DELETE FROM ownership_history WHERE block_height > ?", (int(fork_height),)
             ).rowcount
@@ -321,9 +395,21 @@ class BpubDB:
                         removed_files += 1
                     except OSError:
                         pass
+        if media_dir is not None and orphan_parts:
+            parts_resolved = (Path(media_dir).parent / "parts").resolve()
+            for pname in orphan_parts:
+                target = (parts_resolved / pname).resolve()
+                if target.parent == parts_resolved and target.is_file():
+                    try:
+                        target.unlink()
+                        removed_files += 1
+                    except OSError:
+                        pass
 
         return {
             "items_removed": int(del_items),
+            "parts_removed": int(del_parts),
+            "manifests_removed": int(del_manifests),
             "history_removed": int(del_hist),
             "blocks_removed": int(del_blocks),
             "files_removed": removed_files,
@@ -347,14 +433,15 @@ class BpubDB:
 
     @staticmethod
     def insert_item_tx(conn: sqlite3.Connection, entry: Dict[str, Any]) -> bool:
+        parts_count = entry.get("parts_count")
         cur = conn.execute(
             """
             INSERT OR IGNORE INTO items (
                 txid, block_height, block_hash, block_time,
                 filename, stored_filename, mime, size,
                 bpub_version, script_suffix, bpub_id,
-                funding_txids_json, indexed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                funding_txids_json, parts_count, indexed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 entry["txid"],
@@ -371,10 +458,111 @@ class BpubDB:
                 entry.get("script_suffix"),
                 entry.get("bpub_id"),
                 json.dumps(entry.get("funding_txids") or []),
+                int(parts_count) if parts_count is not None else None,
                 int(entry.get("indexed_at") or time.time()),
             ),
         )
         return cur.rowcount > 0
+
+    # ------------------------------------------------------------------
+    # Multipart parts & manifests
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def has_multipart_part_tx(conn: sqlite3.Connection, txid: str) -> bool:
+        row = conn.execute(
+            "SELECT 1 FROM multipart_parts WHERE txid = ?", (txid,)
+        ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def has_multipart_manifest_tx(conn: sqlite3.Connection, txid: str) -> bool:
+        row = conn.execute(
+            "SELECT 1 FROM multipart_manifests WHERE txid = ?", (txid,)
+        ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def insert_multipart_part_tx(
+        conn: sqlite3.Connection,
+        txid: str,
+        block_height: int,
+        block_hash: str,
+        stored_path: str,
+        size: int,
+    ) -> bool:
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO multipart_parts (
+                txid, block_height, block_hash, stored_path, size
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (txid, int(block_height), str(block_hash or ""), str(stored_path), int(size)),
+        )
+        return cur.rowcount > 0
+
+    @staticmethod
+    def get_multipart_parts_tx(
+        conn: sqlite3.Connection, txids: List[str]
+    ) -> Dict[str, Dict[str, Any]]:
+        if not txids:
+            return {}
+        placeholders = ",".join("?" for _ in txids)
+        rows = conn.execute(
+            f"SELECT txid, block_height, block_hash, stored_path, size "
+            f"FROM multipart_parts WHERE txid IN ({placeholders})",
+            txids,
+        ).fetchall()
+        return {r["txid"]: dict(r) for r in rows}
+
+    @staticmethod
+    def insert_multipart_manifest_tx(
+        conn: sqlite3.Connection,
+        txid: str,
+        block_height: int,
+        block_hash: str,
+        block_time: Optional[int],
+        script_suffix: Optional[str],
+        funding_txids: List[str],
+        manifest_json: str,
+    ) -> bool:
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO multipart_manifests (
+                txid, block_height, block_hash, block_time,
+                script_suffix, funding_txids_json, manifest_json, assembled
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+            """,
+            (
+                txid,
+                int(block_height),
+                str(block_hash or ""),
+                block_time,
+                script_suffix,
+                json.dumps(funding_txids or []),
+                manifest_json,
+            ),
+        )
+        return cur.rowcount > 0
+
+    @staticmethod
+    def list_pending_multipart_manifests_tx(
+        conn: sqlite3.Connection,
+    ) -> List[Dict[str, Any]]:
+        rows = conn.execute(
+            "SELECT * FROM multipart_manifests WHERE assembled = 0 "
+            "ORDER BY block_height ASC, txid ASC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    @staticmethod
+    def mark_multipart_manifest_assembled_tx(
+        conn: sqlite3.Connection, txid: str
+    ) -> None:
+        conn.execute(
+            "UPDATE multipart_manifests SET assembled = 1 WHERE txid = ?",
+            (txid,),
+        )
 
     # ------------------------------------------------------------------
     # Ownership (verified chain-of-custody)
@@ -502,6 +690,9 @@ class BpubDB:
             "bpub_version": row["bpub_version"],
             "script_suffix": row["script_suffix"],
             "bpub_id": row["bpub_id"],
+            "parts_count": int(row["parts_count"])
+            if "parts_count" in row.keys() and row["parts_count"] is not None
+            else 1,
         }
         if "current_owner_p2wpkh" in row.keys():
             owner_addr = row["current_owner_p2wpkh"] or row["current_owner_p2wsh"]
@@ -612,6 +803,18 @@ class BpubDB:
             if row is None:
                 return None
             item = self._row_to_item(row)
+            if item.get("parts_count", 1) > 1:
+                mrow = conn.execute(
+                    "SELECT manifest_json FROM multipart_manifests WHERE txid = ?",
+                    (txid,),
+                ).fetchone()
+                if mrow is not None:
+                    try:
+                        mobj = json.loads(mrow["manifest_json"])
+                        if isinstance(mobj.get("parts"), list):
+                            item["part_txids"] = mobj["parts"]
+                    except Exception:
+                        pass
             if item.get("bpub_id"):
                 hist_rows = conn.execute(
                     """
@@ -670,6 +873,21 @@ class BpubDB:
 
     @staticmethod
     def _row_to_public_order(row: sqlite3.Row) -> Dict[str, Any]:
+        parts_count = (
+            int(row["parts_count"])
+            if "parts_count" in row.keys() and row["parts_count"] is not None
+            else 1
+        )
+        part_txids: List[str] = []
+        multipart_stage: Optional[str] = None
+        if "multipart_state_json" in row.keys() and row["multipart_state_json"]:
+            try:
+                mstate = json.loads(row["multipart_state_json"])
+                if isinstance(mstate, dict):
+                    part_txids = list(mstate.get("part_txids") or [])
+                    multipart_stage = mstate.get("stage")
+            except Exception:
+                pass
         return {
             "order_id": row["order_id"],
             "status": row["status"],
@@ -682,6 +900,10 @@ class BpubDB:
             "size_bytes": row["size_bytes"],
             "bpub_id": row["bpub_id"],
             "data_outputs_count": row["data_outputs_count"],
+            "parts_count": parts_count,
+            "parts_broadcast": len(part_txids) if parts_count > 1 else (1 if row["reveal_txid"] else 0),
+            "part_txids": part_txids,
+            "multipart_stage": multipart_stage,
             "feerate_sat_vb": row["feerate_sat_vb"],
             "est_onchain_sats": row["est_onchain_sats"],
             "ln_amount_sats": row["ln_amount_sats"],
@@ -704,10 +926,10 @@ class BpubDB:
                     order_id, status, created_at, expires_at, updated_at,
                     client_ip, filename, mime, compress, size_bytes,
                     payload_sha256, payload_path, bpub_id, data_outputs_count,
-                    feerate_sat_vb, est_onchain_sats, upfront_funding_sats, ln_amount_sats,
-                    r_hash, payment_request, control_privkey_hex,
-                    needs_funding_conf
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    parts_count, feerate_sat_vb, est_onchain_sats, upfront_funding_sats,
+                    ln_amount_sats, r_hash, payment_request, control_privkey_hex,
+                    needs_funding_conf, multipart_state_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     order["order_id"],
@@ -724,6 +946,7 @@ class BpubDB:
                     order.get("payload_path"),
                     str(order["bpub_id"]),
                     int(order["data_outputs_count"]),
+                    int(order.get("parts_count") or 1),
                     int(order["feerate_sat_vb"]),
                     int(order["est_onchain_sats"]),
                     int(order.get("upfront_funding_sats") or order["est_onchain_sats"]),
@@ -732,6 +955,7 @@ class BpubDB:
                     str(order["payment_request"]),
                     order.get("control_privkey_hex"),
                     1 if order.get("needs_funding_conf") else 0,
+                    order.get("multipart_state_json"),
                 ),
             )
             row = conn.execute(
@@ -852,6 +1076,7 @@ class BpubDB:
         funding_raw_hex: Optional[str] = None,
         reveal_txid: Optional[str] = None,
         reveal_raw_hex: Optional[str] = None,
+        multipart_state_json: Optional[str] = None,
         error_message: Optional[str] = None,
         clear_secrets: bool = False,
     ) -> bool:
@@ -872,6 +1097,9 @@ class BpubDB:
         if reveal_raw_hex is not None:
             sets.append("reveal_raw_hex = ?")
             params.append(reveal_raw_hex)
+        if multipart_state_json is not None:
+            sets.append("multipart_state_json = ?")
+            params.append(multipart_state_json)
         if error_message is not None:
             sets.append("error_message = ?")
             params.append(error_message[:500])

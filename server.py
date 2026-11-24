@@ -90,8 +90,14 @@ BPUB_UTXO_RE = re.compile(r"^([0-9a-fA-F]{64}):(\d+):(\d+)$")
 
 # Single-tx padv3 standardness cap (~630 inputs * 310 bytes ≈ 195 KB stream)
 MAX_UPLOAD_BYTES = int(os.getenv("BPUB_MAX_UPLOAD_BYTES", str(190 * 1024)))
+# Instant Inscribe supports automatic BPUB v1 multipart splitting up to this limit (default 1 MiB)
+MAX_ORDER_UPLOAD_BYTES = max(
+    MAX_UPLOAD_BYTES,
+    int(os.getenv("BPUB_MAX_ORDER_UPLOAD_BYTES", str(1024 * 1024))),
+)
 MAX_JSON_BODY_BYTES = 512 * 1024
 MAX_MULTIPART_BODY_BYTES = MAX_UPLOAD_BYTES + 64 * 1024
+MAX_ORDER_MULTIPART_BODY_BYTES = MAX_ORDER_UPLOAD_BYTES + 64 * 1024
 MAX_UPSTREAM_EXPLORER_BYTES = 2 * 1024 * 1024
 MAX_RAW_TX_HEX_LEN = 400_000  # 200 KB raw tx (~800k WU upper sanity bound)
 MAX_FEERATE = 10_000
@@ -211,7 +217,7 @@ async def _read_upload_bounded(upload: UploadFile, max_bytes: int) -> bytes:
         if total > max_bytes:
             raise HTTPException(
                 status_code=413,
-                detail=f"File exceeds maximum single-tx padv3 upload size ({max_bytes} bytes)",
+                detail=f"File exceeds maximum upload size ({max_bytes} bytes)",
             )
         chunks.append(chunk)
     data = b"".join(chunks)
@@ -532,11 +538,14 @@ def create_app(
             except ValueError:
                 return JSONResponse(status_code=400, content={"detail": "Invalid Content-Length"})
             ctype = (request.headers.get("content-type") or "").lower()
-            max_body = (
-                MAX_MULTIPART_BODY_BYTES
-                if "multipart/form-data" in ctype
-                else MAX_JSON_BODY_BYTES
-            )
+            if "multipart/form-data" in ctype:
+                max_body = (
+                    MAX_ORDER_MULTIPART_BODY_BYTES
+                    if path.startswith("/api/orders")
+                    else MAX_MULTIPART_BODY_BYTES
+                )
+            else:
+                max_body = MAX_JSON_BODY_BYTES
             if cl > max_body:
                 return JSONResponse(
                     status_code=413,
@@ -647,6 +656,7 @@ def create_app(
             "broadcast_enabled": bool(bcast_url),
             "orders_enabled": order_service is not None,
             "max_upload_bytes": MAX_UPLOAD_BYTES,
+            "max_order_upload_bytes": MAX_ORDER_UPLOAD_BYTES,
             "pad_version": "padv3",
         }
 
@@ -758,7 +768,7 @@ def create_app(
             raise HTTPException(
                 status_code=503, detail="Lightning inscription service is not enabled"
             )
-        data = await _read_upload_bounded(file, MAX_UPLOAD_BYTES)
+        data = await _read_upload_bounded(file, MAX_ORDER_UPLOAD_BYTES)
         fname = (filename or file.filename or "file.bin").strip()[:120]
         try:
             return order_service.quote(
@@ -782,7 +792,7 @@ def create_app(
             raise HTTPException(
                 status_code=503, detail="Lightning inscription service is not enabled"
             )
-        data = await _read_upload_bounded(file, MAX_UPLOAD_BYTES)
+        data = await _read_upload_bounded(file, MAX_ORDER_UPLOAD_BYTES)
         fname = (filename or file.filename or "file.bin").strip()[:120]
         ip = _client_ip(request, use_proxy)
         try:
@@ -832,6 +842,9 @@ def create_app(
                 if order.get("reveal_txid")
                 else None
             )
+            order["part_explorer_urls"] = [
+                f"{explorer_url}/tx/{ptx}" for ptx in (order.get("part_txids") or [])
+            ]
         return order
 
     # ------------------------------------------------------------------

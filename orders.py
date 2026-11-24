@@ -19,6 +19,7 @@ Security properties:
 """
 
 import hashlib
+import json
 import math
 import os
 import secrets
@@ -225,6 +226,7 @@ class OrderConfig:
     daily_onchain_budget_sats: int = 5_000_000
     sign_mode: str = "unified"  # "unified" (BLAKE2b 0x21) or "btc" (BIP143 0x01)
     owner_value_sats: int = BPUB_MIN_OWNER_SATS
+    multipart_max_stream_bytes: int = bpub.DEFAULT_MULTIPART_MAX_STREAM_BYTES
     rpc_wallet: str = ""
     broadcast_url: str = "https://mempool.kilombino.com/api/tx"
 
@@ -250,6 +252,18 @@ class OrderConfig:
             owner_value_sats=max(
                 BPUB_MIN_OWNER_SATS, int(os.getenv("ORDER_OWNER_VALUE_SATS", "330"))
             ),
+            multipart_max_stream_bytes=max(
+                1_000,
+                min(
+                    bpub.DEFAULT_MULTIPART_MAX_STREAM_BYTES,
+                    int(
+                        os.getenv(
+                            "ORDER_MULTIPART_MAX_STREAM_BYTES",
+                            str(bpub.DEFAULT_MULTIPART_MAX_STREAM_BYTES),
+                        )
+                    ),
+                ),
+            ),
             rpc_wallet=os.getenv("ORDER_RPC_WALLET", "").strip(),
             broadcast_url=os.getenv(
                 "BROADCAST_URL", "https://mempool.kilombino.com/api/tx"
@@ -263,31 +277,19 @@ def _tx_weight(tx: CTransaction) -> int:
     return stripped * 3 + full
 
 
-def quote_padv3_inscription(
-    data: bytes,
-    filename: str,
-    mime: str,
-    compress: bool,
-    cfg: OrderConfig,
+def _size_single_padv3_step(
+    stream: bytes, cfg: OrderConfig, include_owner: bool = True
 ) -> Dict[str, Any]:
     """
-    Compute exact `padv3` stream/script counts, exact worst-case reveal weight,
-    estimated on-chain cost, and Lightning invoice price in sats.
+    Compute exact `padv3` output counts, worst-case reveal weight, and funding/
+    reveal economics for a single encoded BPUB v5 stream.
     """
-    if not data:
-        raise ValueError("Payload is empty")
-
-    # Use compression only if requested AND it actually reduces payload size.
-    use_compress = bool(compress and len(bpub._raw_deflate(data)) < len(data))
-    stream = bpub.build_stream_v5(data, mime[:100], filename[:120], compress=use_compress)
-    bpub_id = bpub.compute_bpub_v5_id(data)
     data_pubkeys = bpub.encode_stream_to_pubkeys(stream)
     chunks = list(bpub.chunk_data_pubkeys(data_pubkeys, max_pubkeys=bpub.MAX_PUBKEYS_PER_SCRIPT))
     n_outputs = len(chunks)
     if n_outputs < 1 or n_outputs > 643:
-        raise ValueError("Payload exceeds single-transaction padv3 capacity (~195 KiB)")
+        raise ValueError("Encoded stream exceeds single-transaction padv3 capacity (~195 KiB)")
 
-    # Build dummy padv3 scripts to compute exact worst-case reveal weight.
     dummy_ctrl = b"\x02" + b"\x11" * 32
     scripts = [bpub.build_multisig_script(c, dummy_ctrl, pad_suffix=True) for c in chunks]
     dummy_reveal = CMutableTransaction(
@@ -308,16 +310,119 @@ def quote_padv3_inscription(
     per_output_sats = max(547, math.ceil((reveal_fee + BPUB_RETURN_DUST_SATS) / n_outputs))
     data_outputs_total = per_output_sats * n_outputs
 
-    # Conservative funding vsize: 2 inputs + (n_outputs + 1 owner) P2WSH + 1 change output
-    funding_vsize = 11 + 2 * 68 + (n_outputs + 1) * 43 + 43
+    owner_sats = cfg.owner_value_sats if include_owner else 0
+    owner_outs = 1 if include_owner else 0
+    funding_vsize = 11 + 2 * 68 + (n_outputs + owner_outs) * 43 + 43
     funding_fee = math.ceil(funding_vsize * cfg.feerate_sat_vb)
-    est_onchain_sats = funding_fee + reveal_fee + cfg.owner_value_sats
-    upfront_funding_sats = (
-        data_outputs_total + funding_fee + cfg.owner_value_sats + BPUB_RETURN_DUST_SATS
-    )
+    est_onchain_sats = funding_fee + reveal_fee + owner_sats
+    upfront_funding_sats = data_outputs_total + funding_fee + owner_sats + BPUB_RETURN_DUST_SATS
     needs_funding_conf = (funding_vsize + reveal_vsize) > BPUB_ANCESTOR_VSIZE_LIMIT
 
-    kb = math.ceil(len(stream) / 1024)
+    return {
+        "stream_bytes": len(stream),
+        "data_outputs_count": n_outputs,
+        "per_output_sats": per_output_sats,
+        "data_outputs_total_sats": data_outputs_total,
+        "funding_vsize": funding_vsize,
+        "reveal_vsize": reveal_vsize,
+        "funding_fee_sats": funding_fee,
+        "reveal_fee_sats": reveal_fee,
+        "owner_value_sats": owner_sats,
+        "est_onchain_sats": est_onchain_sats,
+        "upfront_funding_sats": upfront_funding_sats,
+        "needs_funding_conf": needs_funding_conf,
+    }
+
+
+def quote_padv3_inscription(
+    data: bytes,
+    filename: str,
+    mime: str,
+    compress: bool,
+    cfg: OrderConfig,
+) -> Dict[str, Any]:
+    """
+    Compute exact `padv3` stream/script counts, exact worst-case reveal weight,
+    estimated on-chain cost, and Lightning invoice price in sats. Automatically
+    switches to wire-compatible BPUB multipart v1 when the encoded stream
+    exceeds a single `padv3` transaction's capacity.
+    """
+    if not data:
+        raise ValueError("Payload is empty")
+
+    bpub_id = bpub.compute_bpub_v5_id(data)
+    max_stream_bytes = cfg.multipart_max_stream_bytes
+
+    # Use compression only if requested AND it actually reduces payload size.
+    use_compress = bool(compress and len(bpub._raw_deflate(data)) < len(data))
+    stream = bpub.build_stream_v5(data, mime[:100], filename[:120], compress=use_compress)
+
+    if len(stream) <= max_stream_bytes:
+        try:
+            step = _size_single_padv3_step(stream, cfg, include_owner=True)
+        except ValueError:
+            step = None
+        if step is not None:
+            kb = math.ceil(step["stream_bytes"] / 1024)
+            raw_ln = (
+                cfg.price_base_sats
+                + kb * cfg.price_per_kb_sats
+                + math.ceil(step["est_onchain_sats"] * cfg.onchain_to_ln_ratio)
+            )
+            ln_amount_sats = max(cfg.min_ln_sats, raw_ln)
+            if ln_amount_sats > cfg.max_ln_sats:
+                raise ValueError(
+                    f"Computed Lightning price ({ln_amount_sats} sats) exceeds configured cap ({cfg.max_ln_sats} sats)"
+                )
+            return {
+                "bpub_id": bpub_id.hex(),
+                "compress": use_compress,
+                "parts_count": 1,
+                "is_multipart": False,
+                "feerate_sat_vb": cfg.feerate_sat_vb,
+                "ln_amount_sats": ln_amount_sats,
+                "pad_version": "padv3",
+                **step,
+            }
+
+    # Multipart BPUB v1 path (wire-compatible with @bitfiles/bpub).
+    plan = bpub.plan_multipart(
+        data,
+        max_stream_bytes=max_stream_bytes,
+        compress="auto" if compress else False,
+    )
+    part_steps = []
+    for part_bytes in plan["parts"]:
+        p_stream = bpub.build_stream_v5(
+            part_bytes, bpub.MULTIPART_PART_MIME, "", compress=False
+        )
+        part_steps.append(_size_single_padv3_step(p_stream, cfg, include_owner=False))
+
+    dummy_manifest = bpub.build_manifest(
+        plan,
+        ["00" * 32] * len(plan["parts"]),
+        mime=mime[:100],
+        filename=filename[:120],
+    )
+    manifest_bytes = bpub.encode_manifest(dummy_manifest)
+    manifest_stream = bpub.build_stream_v5(
+        manifest_bytes, bpub.MULTIPART_MANIFEST_MIME, "", compress=True
+    )
+    manifest_step = _size_single_padv3_step(manifest_stream, cfg, include_owner=True)
+
+    all_steps = part_steps + [manifest_step]
+    stream_bytes = sum(s["stream_bytes"] for s in all_steps)
+    n_outputs = sum(s["data_outputs_count"] for s in all_steps)
+    funding_vsize = sum(s["funding_vsize"] for s in all_steps)
+    reveal_vsize = sum(s["reveal_vsize"] for s in all_steps)
+    funding_fee = sum(s["funding_fee_sats"] for s in all_steps)
+    reveal_fee = sum(s["reveal_fee_sats"] for s in all_steps)
+    est_onchain_sats = funding_fee + reveal_fee + cfg.owner_value_sats
+    max_step_upfront = max(s["upfront_funding_sats"] for s in all_steps)
+    upfront_funding_sats = max(max_step_upfront, est_onchain_sats + BPUB_RETURN_DUST_SATS)
+    needs_funding_conf = any(s["needs_funding_conf"] for s in all_steps)
+
+    kb = math.ceil(stream_bytes / 1024)
     raw_ln = (
         cfg.price_base_sats
         + kb * cfg.price_per_kb_sats
@@ -330,12 +435,15 @@ def quote_padv3_inscription(
         )
 
     return {
-        "bpub_id": bpub_id.hex(),
-        "compress": use_compress,
-        "stream_bytes": len(stream),
+        "bpub_id": plan["bpub_id"].hex(),
+        "compress": plan["compression"] == "deflate-raw",
+        "compression": plan["compression"],
+        "parts_count": len(plan["parts"]),
+        "is_multipart": True,
+        "stream_bytes": stream_bytes,
         "data_outputs_count": n_outputs,
-        "per_output_sats": per_output_sats,
-        "data_outputs_total_sats": data_outputs_total,
+        "per_output_sats": part_steps[0]["per_output_sats"],
+        "data_outputs_total_sats": sum(s["data_outputs_total_sats"] for s in all_steps),
         "funding_vsize": funding_vsize,
         "reveal_vsize": reveal_vsize,
         "funding_fee_sats": funding_fee,
@@ -918,6 +1026,7 @@ class OrderService:
                         "payload_path": str(payload_file),
                         "bpub_id": q["bpub_id"],
                         "data_outputs_count": q["data_outputs_count"],
+                        "parts_count": q.get("parts_count", 1),
                         "feerate_sat_vb": q["feerate_sat_vb"],
                         "est_onchain_sats": q["est_onchain_sats"],
                         "upfront_funding_sats": q["upfront_funding_sats"],
@@ -926,6 +1035,17 @@ class OrderService:
                         "payment_request": inv["payment_request"],
                         "control_privkey_hex": control_privkey_hex,
                         "needs_funding_conf": q["needs_funding_conf"],
+                        "multipart_state_json": json.dumps(
+                            {
+                                "parts_count": q["parts_count"],
+                                "part_txids": [],
+                                "stage": "part",
+                                "current_index": 0,
+                                "waiting_conf": False,
+                            }
+                        )
+                        if q.get("parts_count", 1) > 1
+                        else None,
                     }
                 )
             except Exception:
@@ -971,16 +1091,255 @@ class OrderService:
             if status in ("paid", "awaiting_liquidity"):
                 if self.wallet is None:
                     return self.db.get_order_public(order_id)
-                self._fulfill_paid_order(order)
+                if int(order.get("parts_count") or 1) > 1:
+                    self._fulfill_multipart_order(order)
+                else:
+                    self._fulfill_paid_order(order)
                 return self.db.get_order_public(order_id)
 
             if status == "awaiting_funding_conf":
                 if self.wallet is None:
                     return self.db.get_order_public(order_id)
-                self._try_broadcast_waiting_reveal(order)
+                if int(order.get("parts_count") or 1) > 1:
+                    self._fulfill_multipart_order(order)
+                else:
+                    self._try_broadcast_waiting_reveal(order)
                 return self.db.get_order_public(order_id)
 
             return self.db.get_order_public(order_id)
+
+    def _inscribe_single_stream(
+        self,
+        stream: bytes,
+        ctrl_key: CKey,
+        feerate: int,
+        owner_bpub_id: Optional[bytes] = None,
+    ) -> Tuple[str, str, str, str, bool]:
+        """
+        Build, fund, and sign a single `padv3` funding + reveal pair for `stream`.
+        Returns `(funding_txid, funding_raw_hex, reveal_txid, reveal_raw_hex, needs_conf)`.
+        """
+        ctrl_pub = bytes(ctrl_key.pub)
+        data_pubkeys = bpub.encode_stream_to_pubkeys(stream)
+        chunks = list(
+            bpub.chunk_data_pubkeys(data_pubkeys, max_pubkeys=bpub.MAX_PUBKEYS_PER_SCRIPT)
+        )
+        redeem_scripts = [
+            bpub.build_multisig_script(c, ctrl_pub, pad_suffix=True) for c in chunks
+        ]
+
+        step_cfg = OrderConfig(
+            feerate_sat_vb=feerate,
+            owner_value_sats=self.cfg.owner_value_sats,
+            sign_mode=self.cfg.sign_mode,
+        )
+        step = _size_single_padv3_step(
+            stream, step_cfg, include_owner=(owner_bpub_id is not None)
+        )
+        per_out = step["per_output_sats"]
+
+        outputs: List[Tuple[bytes, int]] = [
+            (bpub.p2wsh_scriptpubkey(rs), per_out) for rs in redeem_scripts
+        ]
+        if owner_bpub_id is not None:
+            owner_h160 = hashlib.new("ripemd160", hashlib.sha256(ctrl_pub).digest()).digest()
+            owner_rs = bpub.build_owner_redeem_script(owner_bpub_id, owner_h160)
+            outputs.append((bpub.p2wsh_scriptpubkey(owner_rs), self.cfg.owner_value_sats))
+
+        funding_txid, funding_raw_hex = self.wallet.fund_and_sign_funding_tx(outputs, feerate)
+        funding_tx = CTransaction.deserialize(bytes.fromhex(funding_raw_hex))
+        funding_vsize = math.ceil(_tx_weight(funding_tx) / 4)
+
+        return_spk = self.wallet.get_return_scriptpubkey()
+        reveal_txid, reveal_raw_hex, reveal_vsize = build_and_sign_padv3_reveal(
+            funding_tx=funding_tx,
+            redeem_scripts=redeem_scripts,
+            control_key=ctrl_key,
+            return_spk=return_spk,
+            feerate_sat_vb=feerate,
+            sign_mode=self.cfg.sign_mode,
+        )
+        needs_conf = (funding_vsize + reveal_vsize) > BPUB_ANCESTOR_VSIZE_LIMIT
+        return funding_txid, funding_raw_hex, reveal_txid, reveal_raw_hex, needs_conf
+
+    def _fulfill_multipart_order(self, order: Dict[str, Any]) -> None:
+        order_id = order["order_id"]
+        try:
+            mstate: Dict[str, Any] = {}
+            if order.get("multipart_state_json"):
+                try:
+                    mstate = json.loads(order["multipart_state_json"])
+                except Exception:
+                    mstate = {}
+            if not isinstance(mstate, dict):
+                mstate = {}
+
+            # If a step reveal is waiting for 1 funding confirmation, check/broadcast it first.
+            if mstate.get("waiting_conf") and mstate.get("step_funding_txid") and mstate.get("step_reveal_raw_hex"):
+                confs = self.wallet.get_confirmations(mstate["step_funding_txid"])
+                if confs < 1:
+                    return
+                self.wallet.broadcast_tx(mstate["step_reveal_raw_hex"])
+                stage = mstate.get("stage", "part")
+                step_ftxid = mstate["step_funding_txid"]
+                step_rtxid = mstate["step_reveal_txid"]
+                mstate["waiting_conf"] = False
+                mstate.pop("step_funding_txid", None)
+                mstate.pop("step_reveal_txid", None)
+                mstate.pop("step_reveal_raw_hex", None)
+                if stage == "manifest":
+                    self._safe_unlink_payload(order.get("payload_path"))
+                    self.db.update_order(
+                        order_id,
+                        status="completed",
+                        funding_txid=step_ftxid,
+                        reveal_txid=step_rtxid,
+                        multipart_state_json=json.dumps(mstate),
+                        error_message="",
+                        clear_secrets=True,
+                    )
+                    return
+                part_txids = list(mstate.get("part_txids") or [])
+                part_txids.append(step_rtxid)
+                mstate["part_txids"] = part_txids
+                mstate["current_index"] = len(part_txids)
+                if len(part_txids) >= int(order.get("parts_count") or 1):
+                    mstate["stage"] = "manifest"
+                self.db.update_order(
+                    order_id,
+                    status="paid",
+                    multipart_state_json=json.dumps(mstate),
+                    error_message="",
+                )
+
+            payload_path = order.get("payload_path")
+            if not payload_path or not Path(payload_path).is_file():
+                raise RuntimeError("Order payload file missing")
+            data = Path(payload_path).read_bytes()
+            if hashlib.sha256(data).hexdigest() != order["payload_sha256"]:
+                raise RuntimeError("Order payload integrity mismatch")
+
+            ctrl_hex = order.get("control_privkey_hex")
+            if not ctrl_hex:
+                raise RuntimeError("Order control key missing")
+            ctrl_key = CKey.from_secret_bytes(bytes.fromhex(ctrl_hex))
+            feerate = int(order["feerate_sat_vb"])
+
+            plan = bpub.plan_multipart(
+                data,
+                max_stream_bytes=self.cfg.multipart_max_stream_bytes,
+                compress=bool(order["compress"]),
+            )
+            parts = plan["parts"]
+            part_txids = list(mstate.get("part_txids") or [])
+            mstate["parts_count"] = len(parts)
+            mstate["part_txids"] = part_txids
+            mstate["current_index"] = len(part_txids)
+            mstate["stage"] = "manifest" if len(part_txids) >= len(parts) else "part"
+
+            while True:
+                stage = mstate["stage"]
+                if stage == "part":
+                    idx = len(part_txids)
+                    stream = bpub.build_stream_v5(
+                        parts[idx], bpub.MULTIPART_PART_MIME, "", compress=False
+                    )
+                    owner_bpub_id = None
+                else:
+                    manifest = bpub.build_manifest(
+                        plan,
+                        part_txids,
+                        mime=order["mime"],
+                        filename=order["filename"],
+                    )
+                    manifest_bytes = bpub.encode_manifest(manifest)
+                    stream = bpub.build_stream_v5(
+                        manifest_bytes, bpub.MULTIPART_MANIFEST_MIME, "", compress=True
+                    )
+                    owner_bpub_id = plan["bpub_id"]
+
+                ftxid, fraw, rtxid, rraw, needs_conf = self._inscribe_single_stream(
+                    stream=stream,
+                    ctrl_key=ctrl_key,
+                    feerate=feerate,
+                    owner_bpub_id=owner_bpub_id,
+                )
+
+                # Persist signed step BEFORE broadcasting funding tx (crash-safe).
+                mstate["step_funding_txid"] = ftxid
+                mstate["step_reveal_txid"] = rtxid
+                mstate["step_reveal_raw_hex"] = rraw
+                mstate["waiting_conf"] = needs_conf
+                self.db.update_order(
+                    order_id,
+                    status="funding_broadcast",
+                    funding_txid=ftxid,
+                    funding_raw_hex=fraw,
+                    reveal_txid=rtxid if stage == "manifest" else None,
+                    reveal_raw_hex=rraw,
+                    multipart_state_json=json.dumps(mstate),
+                    error_message="",
+                )
+
+                self.wallet.broadcast_tx(fraw)
+                self.refresh_hot_wallet_liquidity()
+
+                if needs_conf:
+                    # Only clear secrets once the final manifest step is queued.
+                    final_step = stage == "manifest"
+                    if final_step:
+                        self._safe_unlink_payload(payload_path)
+                    self.db.update_order(
+                        order_id,
+                        status="awaiting_funding_conf",
+                        multipart_state_json=json.dumps(mstate),
+                        clear_secrets=final_step,
+                    )
+                    return
+
+                self.wallet.broadcast_tx(rraw)
+                mstate["waiting_conf"] = False
+                mstate.pop("step_funding_txid", None)
+                mstate.pop("step_reveal_txid", None)
+                mstate.pop("step_reveal_raw_hex", None)
+
+                if stage == "part":
+                    part_txids.append(rtxid)
+                    mstate["part_txids"] = part_txids
+                    mstate["current_index"] = len(part_txids)
+                    if len(part_txids) >= len(parts):
+                        mstate["stage"] = "manifest"
+                    self.db.update_order(
+                        order_id,
+                        status="paid",
+                        multipart_state_json=json.dumps(mstate),
+                        error_message="",
+                    )
+                else:
+                    self._safe_unlink_payload(payload_path)
+                    self.db.update_order(
+                        order_id,
+                        status="completed",
+                        funding_txid=ftxid,
+                        reveal_txid=rtxid,
+                        multipart_state_json=json.dumps(mstate),
+                        error_message="",
+                        clear_secrets=True,
+                    )
+                    return
+        except InsufficientLiquidityError as e:
+            self.db.update_order(
+                order_id,
+                status="awaiting_liquidity",
+                multipart_state_json=json.dumps(mstate) if mstate else None,
+                error_message=str(e),
+            )
+        except Exception as e:
+            self.db.update_order(
+                order_id,
+                status="failed",
+                error_message=str(e),
+            )
 
     def _fulfill_paid_order(self, order: Dict[str, Any]) -> None:
         order_id = order["order_id"]

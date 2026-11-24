@@ -66,14 +66,15 @@
       <div id="order-studio">
         <div class="panel">
           <h2>Instant BPUB v5 (<code>padv3</code>) Inscription via Lightning</h2>
-          <p class="info">
-            Upload a file (up to 190 KiB), pay the Lightning invoice, and the service
+          <p class="info" id="order-intro-text">
+            Upload a file (up to 1.00 MiB; files above ~190 KiB automatically split into
+            BPUB multipart v1 parts + manifest), pay the Lightning invoice, and the service
             will automatically fund, sign, and broadcast your <code>padv3</code>
             inscription on-chain. Uploaded content becomes public and permanent.
           </p>
           <div class="form-grid">
             <div class="field field-full">
-              <label for="order-file">File (max 190 KiB)</label>
+              <label for="order-file" id="order-file-label">File (max 1.00 MiB · multipart supported)</label>
               <input id="order-file" type="file" />
             </div>
             <div class="field">

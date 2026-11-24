@@ -9,6 +9,7 @@
     explorerBaseUrl: '',
     ordersEnabled: false,
     maxUploadBytes: 190 * 1024,
+    maxOrderUploadBytes: 1024 * 1024,
     activeOrderId: null,
     lastOrderRenderKey: null,
     orderPollTimer: null,
@@ -112,6 +113,12 @@
       state.explorerBaseUrl = st.explorer_base_url || '';
       state.ordersEnabled = Boolean(st.orders_enabled);
       state.maxUploadBytes = st.max_upload_bytes || state.maxUploadBytes;
+      state.maxOrderUploadBytes = st.max_order_upload_bytes || state.maxOrderUploadBytes;
+
+      const orderFileLabel = $('order-file-label');
+      if (orderFileLabel) {
+        orderFileLabel.textContent = `File (max ${fmtBytes(state.maxOrderUploadBytes)} · multipart supported)`;
+      }
 
       $('order-disabled-banner').classList.toggle('hidden', state.ordersEnabled);
       $('order-studio').classList.toggle('hidden', !state.ordersEnabled);
@@ -202,7 +209,8 @@
       const info = document.createElement('div');
       info.className = 'info';
       const suffix = item.script_suffix ? ` · ${item.script_suffix}` : '';
-      info.textContent = `${fmtBytes(item.size)} · ${item.mime || 'binary'} · #${item.block_height}${suffix}`;
+      const partsTag = item.parts_count > 1 ? ` · ${item.parts_count} parts` : '';
+      info.textContent = `${fmtBytes(item.size)} · ${item.mime || 'binary'} · #${item.block_height}${suffix}${partsTag}`;
 
       const tx = document.createElement('div');
       tx.className = 'mono info';
@@ -340,6 +348,9 @@
       addRow('Block Height', String(item.block_height));
       addRow('Size / MIME', `${fmtBytes(item.size)} (${item.mime || 'unknown'})`);
       addRow('Format', `BPUB v${item.bpub_version || '?'} (${item.script_suffix || 'unknown'})`);
+      if (item.parts_count > 1) {
+        addRow('Multipart', `${item.parts_count} parts + manifest`);
+      }
       if (item.bpub_id) addRow('BPUB v5 ID', item.bpub_id, null, item.bpub_id);
       addRow('File', 'Open / Download', url);
 
@@ -416,10 +427,10 @@
       box.classList.add('hidden');
       return;
     }
-    if (file.size > state.maxUploadBytes) {
+    if (file.size > state.maxOrderUploadBytes) {
       box.classList.remove('hidden');
       box.className = 'output-box msg-err';
-      box.textContent = `File (${fmtBytes(file.size)}) exceeds max upload size (${fmtBytes(state.maxUploadBytes)}).`;
+      box.textContent = `File (${fmtBytes(file.size)}) exceeds max upload size (${fmtBytes(state.maxOrderUploadBytes)}).`;
       return;
     }
     const fd = new FormData();
@@ -441,8 +452,11 @@
       const confNote = data.needs_funding_conf
         ? ' · large reveal (waits for 1 funding confirmation)'
         : '';
+      const mpNote = data.parts_count > 1
+        ? `Multipart (${data.parts_count} parts + manifest) · `
+        : '';
       box.textContent =
-        `Lightning price: ${data.ln_amount_sats} sats · ` +
+        `Lightning price: ${data.ln_amount_sats} sats · ${mpNote}` +
         `${data.data_outputs_count} padv3 outputs (${fmtBytes(data.stream_bytes)} encoded${confNote})`;
     } catch (_) {
       box.classList.remove('hidden');
@@ -468,6 +482,9 @@
       order.payment_request || '',
       order.funding_txid || '',
       order.reveal_txid || '',
+      order.parts_count || 1,
+      order.parts_broadcast || 0,
+      order.multipart_stage || '',
       order.error_message || '',
     ]);
     if (renderKey === state.lastOrderRenderKey) return;
@@ -480,7 +497,10 @@
 
     const statusLine = document.createElement('div');
     statusLine.className = 'order-status-pill';
-    statusLine.textContent = `Status: ${order.status} · Order ${order.order_id.slice(0, 12)}… · ${order.ln_amount_sats} LN sats`;
+    const mpProgress = order.parts_count > 1
+      ? ` · Multipart ${order.parts_broadcast || 0}/${order.parts_count} parts`
+      : '';
+    statusLine.textContent = `Status: ${order.status}${mpProgress} · Order ${order.order_id.slice(0, 12)}… · ${order.ln_amount_sats} LN sats`;
     body.appendChild(statusLine);
 
     if (order.payment_request && order.status === 'awaiting_payment') {
@@ -567,7 +587,15 @@
     };
     if (order.bpub_id) addKv('BPUB v5 ID', order.bpub_id, null);
     if (order.funding_txid) addKv('Funding TXID', order.funding_txid, order.funding_explorer_url);
-    if (order.reveal_txid) addKv('Reveal TXID', order.reveal_txid, order.reveal_explorer_url);
+    if (order.reveal_txid) {
+      addKv(order.parts_count > 1 ? 'Manifest TXID' : 'Reveal TXID', order.reveal_txid, order.reveal_explorer_url);
+    }
+    if (Array.isArray(order.part_txids) && order.part_txids.length > 0) {
+      const partUrls = Array.isArray(order.part_explorer_urls) ? order.part_explorer_urls : [];
+      order.part_txids.forEach((ptx, i) => {
+        addKv(`Part ${i + 1}/${order.parts_count}`, ptx, partUrls[i] || null);
+      });
+    }
     body.appendChild(dl);
 
     if (order.error_message) {
