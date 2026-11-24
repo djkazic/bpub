@@ -130,6 +130,7 @@ INLINE_MEDIA_EXTS = {
     ".wav",
     ".ogg",
 }
+AV_MEDIA_EXTS = {".mp4", ".webm", ".mp3", ".wav", ".ogg"}
 
 
 # ---------------------------------------------------------------------------
@@ -599,7 +600,14 @@ def create_app(
         )
 
         if path.startswith("/media/"):
-            response.headers["Content-Security-Policy"] = "sandbox; default-src 'none'"
+            ext = Path(path).suffix.lower()
+            if ext in AV_MEDIA_EXTS:
+                response.headers["Content-Security-Policy"] = (
+                    "default-src 'none'; media-src 'self'; script-src 'none'; "
+                    "object-src 'none'; base-uri 'none'"
+                )
+            else:
+                response.headers["Content-Security-Policy"] = "sandbox; default-src 'none'"
             response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
         else:
             response.headers.setdefault(
@@ -619,7 +627,11 @@ def create_app(
         idx = static_dir / "index.html"
         if not idx.is_file():
             raise HTTPException(status_code=404, detail="Frontend not found")
-        return FileResponse(idx, media_type="text/html; charset=utf-8")
+        return FileResponse(
+            idx,
+            media_type="text/html; charset=utf-8",
+            headers={"Cache-Control": "no-cache, must-revalidate"},
+        )
 
     @app.get("/static/{asset}")
     def serve_static(asset: str):
@@ -629,7 +641,11 @@ def create_app(
         if not p.is_file():
             raise HTTPException(status_code=404, detail="Not found")
         mt = "application/javascript; charset=utf-8" if asset.endswith(".js") else "text/css; charset=utf-8"
-        return FileResponse(p, media_type=mt)
+        return FileResponse(
+            p,
+            media_type=mt,
+            headers={"Cache-Control": "no-cache, must-revalidate"},
+        )
 
     @app.get("/media/{stored_filename}")
     def serve_media(stored_filename: str):

@@ -364,6 +364,15 @@ class ServerSecurityAndApiTest(unittest.TestCase):
             self.assertEqual(r_png.headers["content-security-policy"], "sandbox; default-src 'none'")
             self.assertNotIn("attachment", r_png.headers.get("content-disposition", ""))
 
+            # Safe MP4 served inline with media-src 'self' + script-src 'none' (playable in direct tab)
+            (app.state.media_dir / f"{txid}_clip.mp4").write_bytes(b"\x00\x00\x00\x18ftypmp42")
+            r_mp4 = client.get(f"/media/{txid}_clip.mp4")
+            self.assertEqual(r_mp4.status_code, 200)
+            self.assertEqual(r_mp4.headers["content-type"], "video/mp4")
+            self.assertIn("media-src 'self'", r_mp4.headers["content-security-policy"])
+            self.assertIn("script-src 'none'", r_mp4.headers["content-security-policy"])
+            self.assertNotIn("attachment", r_mp4.headers.get("content-disposition", ""))
+
             # Binary file served as attachment with sandbox CSP
             r_bin = client.get(f"/media/{txid}_doc.bin")
             self.assertEqual(r_bin.status_code, 200)
