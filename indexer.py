@@ -217,10 +217,10 @@ class EsploraBlockClient:
                     self._cooldown_until[api] = time.monotonic() + 10.0
                     last_err = e
                     continue
-                if resp.status_code == 429:
+                if resp.status_code in (403, 429):
                     retry_after = int(resp.headers.get("Retry-After") or (2 ** (round_idx + 1)))
                     self._cooldown_until[api] = time.monotonic() + min(60, max(2, retry_after))
-                    last_err = RuntimeError(f"429 from {api}{path}")
+                    last_err = RuntimeError(f"HTTP {resp.status_code} from {api}{path}")
                     continue
                 if resp.status_code >= 500:
                     self._cooldown_until[api] = time.monotonic() + 10.0

@@ -620,15 +620,18 @@ class EsploraHotWalletBackend:
     def _fetch_utxos(self) -> List[Dict[str, Any]]:
         last_err = None
         utxos = None
+        headers = {"User-Agent": "bpub-worker/1.0"}
         for api in self._ordered_apis():
             try:
                 resp = requests.get(
-                    f"{api}/address/{self.address}/utxo", timeout=self.timeout
+                    f"{api}/address/{self.address}/utxo",
+                    headers=headers,
+                    timeout=self.timeout,
                 )
             except requests.RequestException as e:
                 last_err = e
                 continue
-            if resp.status_code in (429,) or resp.status_code >= 500:
+            if resp.status_code in (403, 429) or resp.status_code >= 500:
                 last_err = RuntimeError(f"HTTP {resp.status_code} from {api}")
                 continue
             if resp.status_code != 200:
@@ -728,12 +731,13 @@ class EsploraHotWalletBackend:
 
     def broadcast_tx(self, raw_hex: str) -> str:
         last_err = None
+        headers = {"Content-Type": "text/plain", "User-Agent": "bpub-worker/1.0"}
         for url in self.broadcast_urls:
             try:
                 resp = requests.post(
                     url,
                     data=raw_hex,
-                    headers={"Content-Type": "text/plain"},
+                    headers=headers,
                     timeout=self.timeout,
                 )
             except requests.RequestException as e:
@@ -741,7 +745,7 @@ class EsploraHotWalletBackend:
                 continue
             if resp.status_code == 200:
                 return resp.text.strip()
-            if resp.status_code == 429 or resp.status_code >= 500:
+            if resp.status_code in (403, 429) or resp.status_code >= 500:
                 last_err = RuntimeError(f"HTTP {resp.status_code} from {url}: {resp.text[:200]}")
                 continue
             raise RuntimeError(
@@ -750,15 +754,20 @@ class EsploraHotWalletBackend:
         raise RuntimeError(f"All Esplora broadcast endpoints failed: {last_err}")
 
     def get_confirmations(self, txid: str) -> int:
+        headers = {"User-Agent": "bpub-worker/1.0"}
         for api in self._ordered_apis():
             try:
-                resp = requests.get(f"{api}/tx/{txid}/status", timeout=self.timeout)
+                resp = requests.get(
+                    f"{api}/tx/{txid}/status", headers=headers, timeout=self.timeout
+                )
                 if resp.status_code != 200:
                     continue
                 st = resp.json()
                 if not st.get("confirmed"):
                     return 0
-                tip_resp = requests.get(f"{api}/blocks/tip/height", timeout=self.timeout)
+                tip_resp = requests.get(
+                    f"{api}/blocks/tip/height", headers=headers, timeout=self.timeout
+                )
                 if tip_resp.status_code == 200 and st.get("block_height"):
                     return max(1, int(tip_resp.text.strip()) - int(st["block_height"]) + 1)
                 return 1

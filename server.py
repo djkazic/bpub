@@ -678,7 +678,10 @@ def create_app(
         for base in ordered:
             try:
                 with requests.get(
-                    f"{base}/api/tx/{txid_clean}", timeout=10, stream=True
+                    f"{base}/api/tx/{txid_clean}",
+                    headers={"User-Agent": "bpub-server/1.0"},
+                    timeout=10,
+                    stream=True,
                 ) as resp:
                     if resp.status_code == 404:
                         saw_404 = True
@@ -933,7 +936,10 @@ def create_app(
                 resp = requests.post(
                     ep,
                     data=raw_hex,
-                    headers={"Content-Type": "text/plain"},
+                    headers={
+                        "Content-Type": "text/plain",
+                        "User-Agent": "bpub-server/1.0",
+                    },
                     timeout=15,
                 )
             except requests.RequestException:
@@ -946,7 +952,7 @@ def create_app(
                     "txid": txid_out,
                     "explorer_url": f"{explorer_url}/tx/{txid_out}" if explorer_url else None,
                 }
-            if resp.status_code == 429 or resp.status_code >= 500:
+            if resp.status_code in (403, 429) or resp.status_code >= 500:
                 continue
             last_reject = (resp.text or "Broadcast rejected").strip()[:300]
             break
