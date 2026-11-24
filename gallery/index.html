@@ -4,231 +4,225 @@
   <meta charset="utf-8" />
   <title>BPUB On-Chain Gallery</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>
-    :root {
-      color-scheme: dark;
-    }
-    body {
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
-      margin: 0;
-      padding: 1rem;
-      background: #050505;
-      color: #f5f5f5;
-    }
-    header {
-      max-width: 900px;
-      margin: 0 auto 1rem;
-    }
-    h1 {
-      margin: 0 0 0.25rem;
-      font-size: 1.8rem;
-    }
-    p {
-      margin: 0;
-      opacity: 0.75;
-      font-size: 0.9rem;
-    }
-    #grid {
-      max-width: 1100px;
-      margin: 1.5rem auto 0;
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-      gap: 1rem;
-    }
-    .card {
-      background: #111;
-      border-radius: 14px;
-      overflow: hidden;
-      box-shadow: 0 4px 16px rgba(0,0,0,0.5);
-      display: flex;
-      flex-direction: column;
-    }
-    .card img {
-      display: block;
-      width: 100%;
-      height: 220px;
-      object-fit: cover;
-      background: #000;
-    }
-    .meta {
-      padding: 0.6rem 0.8rem 0.8rem;
-      font-size: 0.8rem;
-    }
-    .filename {
-      font-weight: 600;
-      margin-bottom: 0.2rem;
-      word-break: break-word;
-    }
-    .info {
-      opacity: 0.8;
-      margin-bottom: 0.25rem;
-    }
-    .txid {
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-      font-size: 0.7rem;
-      opacity: 0.7;
-      word-break: break-all;
-    }
-    .pill {
-      display: inline-block;
-      padding: 0.12rem 0.45rem;
-      border-radius: 999px;
-      background: #222;
-      font-size: 0.7rem;
-      margin-left: 0.3rem;
-    }
-    .owner {
-      margin-top: 0.25rem;
-      font-size: 0.7rem;
-      opacity: 0.8;
-      word-break: break-all;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-    }
-    .owner-label {
-      opacity: 0.6;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-      font-size: 0.65rem;
-      margin-right: 0.25rem;
-    }
-    #status {
-      max-width: 900px;
-      margin: 0.5rem auto 0;
-      font-size: 0.8rem;
-      opacity: 0.7;
-    }
-  </style>
+  <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
-  <header>
-    <h1>BPUB On-Chain Gallery</h1>
-    <p>Images reconstructed from BPUB reveal transactions on Bitcoin.</p>
-    <div id="status"></div>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <h1>BPUB Gallery</h1>
+        <span class="badge">v5 · padv3</span>
+      </div>
+      <nav class="nav">
+        <button id="tab-gallery" class="active" type="button">Gallery</button>
+        <button id="tab-inscribe" type="button">Instant Inscribe</button>
+        <button id="tab-embed" type="button">PSBT Studio</button>
+      </nav>
+    </div>
   </header>
 
-  <div id="grid"></div>
+  <main class="container">
+    <div id="stats-bar" class="stats-bar">Loading gallery stats…</div>
 
-  <script>
-    async function loadGallery() {
-      const statusEl = document.getElementById('status');
-      try {
-        const res = await fetch('manifest.json', { cache: 'no-cache' });
-        if (!res.ok) {
-          statusEl.textContent = 'No manifest.json yet – waiting for indexer...';
-          return;
-        }
+    <!-- Gallery View -->
+    <section id="view-gallery">
+      <div class="controls">
+        <input id="search-input" type="search" placeholder="Search filename, txid, bpub_id, owner…" maxlength="128" />
+        <select id="mime-filter">
+          <option value="">All types</option>
+          <option value="image">Images</option>
+          <option value="text">Text / JSON</option>
+          <option value="other">Other</option>
+        </select>
+        <select id="version-filter">
+          <option value="">All versions</option>
+          <option value="5">v5</option>
+          <option value="4">v4</option>
+          <option value="1">v3.5</option>
+        </select>
+        <button id="search-btn" class="btn btn-secondary" type="button">Filter</button>
+      </div>
 
-        const items = await res.json();
-        if (!Array.isArray(items) || items.length === 0) {
-          statusEl.textContent = 'No BPUB reveals indexed yet.';
-          return;
-        }
+      <div id="grid"></div>
 
-        let ownership = {};
-        try {
-          const ownRes = await fetch('ownership.json', { cache: 'no-cache' });
-          if (ownRes.ok) {
-            ownership = await ownRes.json();
-          }
-        } catch (e) {
-          // ignore; ownership stays empty
-        }
+      <div id="pager" class="pager hidden">
+        <button id="prev-page" class="btn btn-secondary" type="button">Previous</button>
+        <span id="page-info" class="info"></span>
+        <button id="next-page" class="btn btn-secondary" type="button">Next</button>
+      </div>
+    </section>
 
-        // newest first
-        items.sort((a, b) => (b.block_height || 0) - (a.block_height || 0));
+    <!-- Instant Inscribe (Custodial Lightning -> padv3) View -->
+    <section id="view-inscribe" class="hidden">
+      <div id="order-disabled-banner" class="panel hidden">
+        <h2>Lightning Inscription Service Unavailable</h2>
+        <p class="info">
+          Custodial Lightning orders are not enabled on this server yet. Use the
+          <strong>PSBT Studio</strong> tab to build and broadcast a self-custodial
+          <code>padv3</code> embed directly.
+        </p>
+      </div>
 
-        statusEl.textContent = `Showing ${items.length} item${items.length === 1 ? '' : 's'}.`;
+      <div id="order-studio">
+        <div class="panel">
+          <h2>Instant BPUB v5 (<code>padv3</code>) Inscription via Lightning</h2>
+          <p class="info">
+            Upload a file (up to 190 KiB), pay the Lightning invoice, and the service
+            will automatically fund, sign, and broadcast your <code>padv3</code>
+            inscription on-chain. Uploaded content becomes public and permanent.
+          </p>
+          <div class="form-grid">
+            <div class="field field-full">
+              <label for="order-file">File (max 190 KiB)</label>
+              <input id="order-file" type="file" />
+            </div>
+            <div class="field">
+              <label for="order-filename">Filename (on-chain metadata)</label>
+              <input id="order-filename" type="text" maxlength="120" placeholder="image.jpg" />
+            </div>
+            <div class="field">
+              <label for="order-mime">MIME type</label>
+              <input id="order-mime" type="text" maxlength="100" value="application/octet-stream" />
+            </div>
+            <div class="field">
+              <label for="order-compress">Compression</label>
+              <select id="order-compress">
+                <option value="true" selected>Raw DEFLATE (auto if smaller)</option>
+                <option value="false">Uncompressed</option>
+              </select>
+            </div>
+          </div>
+          <div id="order-quote-out" class="output-box hidden"></div>
+          <div class="actions-row">
+            <button id="btn-create-order" class="btn" type="button">Create Lightning Invoice</button>
+          </div>
+        </div>
 
-        const SAFE_IMG_EXTS = ['.jpg', '.jpeg', '.png', '.gif', '.webp'];
-        const grid = document.getElementById('grid');
-        items.forEach(item => {
-          if (typeof item.stored_filename !== 'string' || !item.stored_filename) return;
-          if (item.stored_filename.includes('/') || item.stored_filename.includes('\\') || item.stored_filename.includes('..')) {
-            return;
-          }
+        <div id="order-status-panel" class="panel hidden">
+          <h2>Order Status</h2>
+          <div id="order-status-body"></div>
+        </div>
+      </div>
+    </section>
 
-          const card = document.createElement('div');
-          card.className = 'card';
+    <!-- Create padv3 Embed (Self-Custody PSBT) View -->
+    <section id="view-embed" class="hidden">
+      <div class="panel">
+        <h2>1. File &amp; padv3 Cost Estimate</h2>
+        <div class="form-grid">
+          <div class="field field-full">
+            <label for="embed-file">File (max 190 KiB for single-tx padv3)</label>
+            <input id="embed-file" type="file" />
+          </div>
+          <div class="field">
+            <label for="embed-filename">Filename (metadata)</label>
+            <input id="embed-filename" type="text" maxlength="120" placeholder="image.jpg" />
+          </div>
+          <div class="field">
+            <label for="embed-mime">MIME type</label>
+            <input id="embed-mime" type="text" maxlength="100" value="application/octet-stream" />
+          </div>
+          <div class="field">
+            <label for="embed-compress">Compression</label>
+            <select id="embed-compress">
+              <option value="true" selected>Raw DEFLATE (recommended)</option>
+              <option value="false">Uncompressed</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="embed-feerate">Funding Feerate (sat/vB)</label>
+            <input id="embed-feerate" type="number" min="1" max="10000" value="1" />
+          </div>
+          <div class="field">
+            <label for="embed-reveal-feerate">Reveal Feerate (sat/vB)</label>
+            <input id="embed-reveal-feerate" type="number" min="1" max="10000" value="1" />
+          </div>
+          <div class="field">
+            <label for="embed-owner-value">Owner Output Value (sats, min 330)</label>
+            <input id="embed-owner-value" type="number" min="330" max="100000000" value="10000" />
+          </div>
+        </div>
+        <div id="estimate-out" class="output-box hidden"></div>
+      </div>
 
-          const mediaUrl = 'media/' + encodeURIComponent(item.stored_filename);
-          const lowerName = item.stored_filename.toLowerCase();
-          const isSafeImage = SAFE_IMG_EXTS.some(ext => lowerName.endsWith(ext));
+      <div class="panel">
+        <h2>2. Build Funding PSBT (v5 + padv3)</h2>
+        <div class="form-grid">
+          <div class="field">
+            <label for="fund-control-pk">Control Pubkey (33-byte hex)</label>
+            <input id="fund-control-pk" type="text" placeholder="02..." maxlength="66" />
+          </div>
+          <div class="field">
+            <label for="fund-owner-addr">v5 Owner Address (bc1q…)</label>
+            <input id="fund-owner-addr" type="text" placeholder="bc1q..." />
+          </div>
+          <div class="field">
+            <label for="fund-utxo">Funding UTXO (TXID:VOUT)</label>
+            <input id="fund-utxo" type="text" placeholder="txid:0" />
+          </div>
+          <div class="field">
+            <label for="fund-value">UTXO Value (sats)</label>
+            <input id="fund-value" type="number" min="1000" placeholder="50000" />
+          </div>
+          <div class="field">
+            <label for="fund-prev-addr">Funding UTXO Prev Address (bc1q… or bc1p…)</label>
+            <input id="fund-prev-addr" type="text" placeholder="bc1q... or bc1p..." />
+          </div>
+          <div class="field">
+            <label for="fund-change-addr">Change Address (bc1q… or bc1p…)</label>
+            <input id="fund-change-addr" type="text" placeholder="bc1q... or bc1p..." />
+          </div>
+        </div>
+        <div class="actions-row">
+          <button id="btn-lookup-utxo" class="btn btn-secondary" type="button">Auto-fill UTXO from Explorer</button>
+          <button id="btn-build-fund" class="btn" type="button">Build Funding PSBT</button>
+        </div>
+        <div id="fund-out" class="output-box hidden"></div>
+      </div>
 
-          const link = document.createElement('a');
-          link.href = mediaUrl;
-          link.target = '_blank';
-          link.rel = 'noopener noreferrer';
+      <div class="panel">
+        <h2>3. Build Reveal PSBT (padv3)</h2>
+        <div class="form-grid">
+          <div class="field field-full">
+            <label for="reveal-utxos">BPUB Data UTXOs (one TXID:VOUT:VALUE per line)</label>
+            <textarea id="reveal-utxos" rows="4" placeholder="funding_txid:0:547"></textarea>
+          </div>
+        </div>
+        <div class="actions-row">
+          <button id="btn-build-reveal" class="btn" type="button">Build Reveal PSBT</button>
+        </div>
+        <div id="reveal-out" class="output-box hidden"></div>
+      </div>
 
-          if (isSafeImage) {
-            const img = document.createElement('img');
-            img.src = mediaUrl;
-            img.alt = item.filename || item.txid;
-            link.appendChild(img);
-          } else {
-            link.download = item.stored_filename;
-            const placeholder = document.createElement('div');
-            placeholder.style.cssText = 'height:220px;display:flex;align-items:center;justify-content:center;background:#000;color:#888;font-size:0.85rem;';
-            placeholder.textContent = 'Download file';
-            link.appendChild(placeholder);
-          }
+      <div class="panel">
+        <h2>4. Broadcast Signed Transaction</h2>
+        <div class="form-grid">
+          <div class="field field-full">
+            <label for="bcast-hex">Signed Raw Transaction Hex (broadcasts via configured explorer)</label>
+            <textarea id="bcast-hex" rows="3" placeholder="020000000001..."></textarea>
+          </div>
+        </div>
+        <div class="actions-row">
+          <button id="btn-broadcast" class="btn" type="button">Broadcast Transaction</button>
+        </div>
+        <div id="bcast-out" class="output-box hidden"></div>
+      </div>
+    </section>
+  </main>
 
-          const meta = document.createElement('div');
-          meta.className = 'meta';
+  <div id="modal-backdrop" class="modal-backdrop hidden">
+    <div class="modal" role="dialog" aria-modal="true">
+      <div class="modal-header">
+        <strong id="modal-title">Item Details</strong>
+        <div class="modal-header-actions">
+          <button id="modal-copy-link" class="btn btn-secondary btn-sm" type="button">Copy Link</button>
+          <button id="modal-close" class="btn btn-secondary btn-sm" type="button">Close</button>
+        </div>
+      </div>
+      <div id="modal-body"></div>
+    </div>
+  </div>
 
-          const name = document.createElement('div');
-          name.className = 'filename';
-          name.textContent = item.filename || '(unnamed)';
-
-          const info = document.createElement('div');
-          info.className = 'info';
-          const size = item.size ? `${(item.size / 1024).toFixed(1)} kB` : 'unknown size';
-          const mime = item.mime || 'application/octet-stream';
-          const height = item.block_height != null ? `block ${item.block_height}` : 'unknown block';
-          info.textContent = `${size} · ${mime} · ${height}`;
-
-          const tx = document.createElement('div');
-          tx.className = 'txid';
-          tx.textContent = item.txid;
-
-          meta.appendChild(name);
-          meta.appendChild(info);
-          meta.appendChild(tx);
-
-          if (
-            typeof item.bpub_id === 'string' &&
-            ownership &&
-            Object.prototype.hasOwnProperty.call(ownership, item.bpub_id)
-          ) {
-            const ownerRecord = ownership[item.bpub_id];
-            const ownerAddr = ownerRecord && (ownerRecord.current_owner_p2wpkh || ownerRecord.current_owner_p2wsh);
-            if (ownerAddr) {
-              const ownerDiv = document.createElement('div');
-              ownerDiv.className = 'owner';
-
-              const label = document.createElement('span');
-              label.className = 'owner-label';
-              label.textContent = 'Owner';
-
-              const addrSpan = document.createElement('span');
-              addrSpan.textContent = ownerAddr;
-
-              ownerDiv.appendChild(label);
-              ownerDiv.appendChild(addrSpan);
-              meta.appendChild(ownerDiv);
-            }
-          }
-
-          card.appendChild(link);
-          card.appendChild(meta);
-          grid.appendChild(card);
-        });
-      } catch (err) {
-        statusEl.textContent = 'Error loading gallery: ' + err;
-        console.error(err);
-      }
-    }
-
-    loadGallery();
-  </script>
+  <script src="/static/app.js"></script>
 </body>
 </html>

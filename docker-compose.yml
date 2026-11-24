@@ -1,0 +1,55 @@
+services:
+  web:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      BPUB_HOST: "0.0.0.0"
+      BPUB_PORT: "8888"
+      BPUB_TRUST_PROXY: "${BPUB_TRUST_PROXY:-1}"
+      GALLERY_DIR: "/data/gallery"
+      BPUB_DB_PATH: "/data/gallery/bpub.db"
+      ORDER_PAYLOAD_DIR: "/data/order_payloads"
+      ORDER_HOT_WIF: ""
+    ports:
+      - "0.0.0.0:8888:8888"
+    volumes:
+      - bpub_data:/data
+      # Mount read-only LND invoice macaroon & TLS cert if enabling Lightning orders:
+      # - /path/to/lnd/invoice.macaroon:/secrets/invoice.macaroon:ro
+      # - /path/to/lnd/tls.cert:/secrets/lnd-tls.cert:ro
+    command: ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8888"]
+
+  indexer:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      GALLERY_DIR: "/data/gallery"
+      BPUB_DB_PATH: "/data/gallery/bpub.db"
+    volumes:
+      - bpub_data:/data
+    command: ["python3", "indexer.py"]
+
+  order-worker:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      GALLERY_DIR: "/data/gallery"
+      BPUB_DB_PATH: "/data/gallery/bpub.db"
+      ORDER_PAYLOAD_DIR: "/data/order_payloads"
+    volumes:
+      - bpub_data:/data
+      # - /path/to/lnd/invoice.macaroon:/secrets/invoice.macaroon:ro
+      # - /path/to/lnd/tls.cert:/secrets/lnd-tls.cert:ro
+    command: ["python3", "order_worker.py"]
+
+volumes:
+  bpub_data:

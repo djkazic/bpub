@@ -28,9 +28,13 @@ import sys
 import time
 import json
 import re
+import io
+import struct
 import hashlib
 from pathlib import Path
 from typing import Optional, Tuple, List
+
+import requests
 
 try:
     from dotenv import load_dotenv
@@ -52,48 +56,202 @@ from bpub import (
     decode_owner_redeem_script,
     parse_bpub_multisig,
 )
+from db import BpubDB
 
 
 def load_config():
     """Load config from .env and environment variables."""
-    if load_dotenv is None:
-        sys.exit("python-dotenv is required to run indexer.py")
-    load_dotenv()
+    if load_dotenv is not None:
+        load_dotenv()
 
-    rpc_user = os.getenv("BITCOIN_RPC_USER")
-    rpc_pass = os.getenv("BITCOIN_RPC_PASSWORD")
-    rpc_host = os.getenv("BITCOIN_RPC_HOST", "127.0.0.1")
-    rpc_port = os.getenv("BITCOIN_RPC_PORT", "8332")
+    rpc_user = os.getenv("BITCOIN_RPC_USER", "").strip()
+    rpc_pass = os.getenv("BITCOIN_RPC_PASSWORD", "").strip()
+    rpc_host = os.getenv("BITCOIN_RPC_HOST", "127.0.0.1").strip()
+    rpc_port = os.getenv("BITCOIN_RPC_PORT", "8332").strip()
 
-    if not rpc_user or not rpc_pass:
-        sys.exit("BITCOIN_RPC_USER and BITCOIN_RPC_PASSWORD must be set in .env")
+    explorer_url = os.getenv("EXPLORER_BASE_URL", "https://mempool.kilombino.com").strip().rstrip("/")
+    esplora_urls_raw = os.getenv(
+        "ESPLORA_URLS",
+        "https://mempool.kilombino.com,https://mempool.guide",
+    ).strip()
+    esplora_urls = [u.strip().rstrip("/") for u in esplora_urls_raw.split(",") if u.strip()]
+    if not esplora_urls and explorer_url:
+        esplora_urls = [explorer_url]
 
-    gallery_dir = os.getenv("GALLERY_DIR")
-    if not gallery_dir:
-        sys.exit("GALLERY_DIR must be set in .env")
+    source = os.getenv("INDEXER_SOURCE", "").strip().lower()
+    if not source:
+        source = "rpc" if (rpc_user and rpc_pass) else "esplora"
+    if source not in ("rpc", "esplora"):
+        sys.exit("INDEXER_SOURCE must be 'rpc' or 'esplora'")
+    if source == "rpc" and (not rpc_user or not rpc_pass):
+        sys.exit("BITCOIN_RPC_USER and BITCOIN_RPC_PASSWORD must be set when INDEXER_SOURCE=rpc")
+    if source == "esplora" and not esplora_urls:
+        sys.exit("ESPLORA_URLS or EXPLORER_BASE_URL must be set when INDEXER_SOURCE=esplora")
 
-    start_height_str = os.getenv("START_HEIGHT", "924329")
+    gallery_dir = os.getenv("GALLERY_DIR", "gallery").strip() or "gallery"
+
+    start_height_str = os.getenv("START_HEIGHT", "961640")
     try:
         start_height = int(start_height_str)
     except ValueError:
         sys.exit("START_HEIGHT must be an integer")
 
     poll_interval = int(os.getenv("POLL_INTERVAL", "30"))
+    esplora_delay = max(0.0, float(os.getenv("ESPLORA_REQUEST_DELAY", "0.25")))
 
     return {
+        "source": source,
         "rpc_user": rpc_user,
         "rpc_pass": rpc_pass,
         "rpc_host": rpc_host,
         "rpc_port": rpc_port,
+        "explorer_url": explorer_url,
+        "esplora_urls": esplora_urls,
+        "esplora_delay": esplora_delay,
         "gallery_dir": Path(gallery_dir),
         "start_height": start_height,
         "poll_interval": poll_interval,
     }
 
 
+def _read_compact_size(stream: io.BytesIO) -> int:
+    b = stream.read(1)
+    if not b:
+        raise ValueError("Unexpected EOF reading compactSize")
+    n = b[0]
+    if n < 0xFD:
+        return n
+    if n == 0xFD:
+        return struct.unpack("<H", stream.read(2))[0]
+    if n == 0xFE:
+        return struct.unpack("<I", stream.read(4))[0]
+    return struct.unpack("<Q", stream.read(8))[0]
+
+
+def parse_raw_block(raw_bytes: bytes, blockhash: str = "") -> dict:
+    """
+    Deserialize a raw Bitcoin (80-byte header) or BLAKE2b (164-byte header,
+    version bit 0x80000000 set) block into the verbosity-2 block dict shape
+    expected by `index_block()`.
+    """
+    if len(raw_bytes) < 81:
+        raise ValueError("Raw block too short")
+    version = struct.unpack_from("<I", raw_bytes, 0)[0]
+    header_len = 164 if (version & 0x80000000) else 80
+    if len(raw_bytes) < header_len + 1:
+        raise ValueError("Raw block shorter than header")
+
+    block_time = struct.unpack_from("<I", raw_bytes, 68)[0]
+    stream = io.BytesIO(raw_bytes[header_len:])
+    tx_count = _read_compact_size(stream)
+    txs = []
+    for _ in range(tx_count):
+        tx = CTransaction.stream_deserialize(stream)
+        txid = tx.GetTxid()[::-1].hex()
+        tx_hex = tx.serialize(include_witness=True).hex()
+        vins = []
+        wit = getattr(tx, "wit", None)
+        for idx, vin in enumerate(tx.vin):
+            if vin.prevout.is_null():
+                vins.append({"coinbase": bytes(vin.scriptSig).hex()})
+                continue
+            vin_d = {}
+            if wit is not None and idx < len(wit.vtxinwit):
+                stack = list(wit.vtxinwit[idx].scriptWitness.stack)
+                if stack:
+                    vin_d["txinwitness"] = [bytes(item).hex() for item in stack]
+            vins.append(vin_d)
+        txs.append({"txid": txid, "hex": tx_hex, "vin": vins})
+    return {"hash": blockhash, "time": block_time, "tx": txs}
+
+
+class EsploraBlockClient:
+    """
+    Drop-in RPC-compatible block reader backed by one or more Esplora / mempool
+    APIs (e.g. mempool.kilombino.com + mempool.guide). Round-robins requests
+    with per-host pacing and automatic failover + cooldown on 429/5xx/errors.
+    """
+
+    def __init__(self, base_urls, request_delay: float = 0.25, timeout: int = 30):
+        if isinstance(base_urls, str):
+            urls = [u.strip().rstrip("/") for u in base_urls.split(",") if u.strip()]
+        else:
+            urls = [str(u).strip().rstrip("/") for u in base_urls if str(u).strip()]
+        if not urls:
+            raise ValueError("At least one Esplora URL is required")
+        self.apis = [f"{u}/api" for u in urls]
+        self.request_delay = max(0.0, float(request_delay))
+        self.timeout = timeout
+        self._rr = 0
+        self._last_req = {api: 0.0 for api in self.apis}
+        self._cooldown_until = {api: 0.0 for api in self.apis}
+        self._session = requests.Session()
+        self._session.headers["User-Agent"] = "bpub-indexer/1.0"
+
+    def _ordered_apis(self) -> List[str]:
+        n = len(self.apis)
+        start = self._rr % n
+        self._rr = (self._rr + 1) % n
+        rotated = [self.apis[(start + i) % n] for i in range(n)]
+        now = time.monotonic()
+        healthy = [a for a in rotated if self._cooldown_until[a] <= now]
+        cooling = [a for a in rotated if self._cooldown_until[a] > now]
+        cooling.sort(key=lambda a: self._cooldown_until[a])
+        return healthy + cooling
+
+    def _get(self, path: str, expect_bytes: bool = False):
+        last_err = None
+        for round_idx in range(3):
+            for api in self._ordered_apis():
+                now = time.monotonic()
+                cd_wait = self._cooldown_until[api] - now
+                if cd_wait > 0 and round_idx > 0:
+                    time.sleep(min(30.0, cd_wait))
+                wait = self.request_delay - (time.monotonic() - self._last_req[api])
+                if wait > 0:
+                    time.sleep(wait)
+                self._last_req[api] = time.monotonic()
+                try:
+                    resp = self._session.get(f"{api}{path}", timeout=self.timeout)
+                except requests.RequestException as e:
+                    self._cooldown_until[api] = time.monotonic() + 10.0
+                    last_err = e
+                    continue
+                if resp.status_code == 429:
+                    retry_after = int(resp.headers.get("Retry-After") or (2 ** (round_idx + 1)))
+                    self._cooldown_until[api] = time.monotonic() + min(60, max(2, retry_after))
+                    last_err = RuntimeError(f"429 from {api}{path}")
+                    continue
+                if resp.status_code >= 500:
+                    self._cooldown_until[api] = time.monotonic() + 10.0
+                    last_err = RuntimeError(f"HTTP {resp.status_code} from {api}{path}")
+                    continue
+                if resp.status_code != 200:
+                    raise RuntimeError(
+                        f"Esplora GET {api}{path} HTTP {resp.status_code}: {resp.text[:200]}"
+                    )
+                return resp.content if expect_bytes else resp.text.strip()
+        raise RuntimeError(f"All Esplora backends failed for {path}: {last_err}")
+
+    def getblockcount(self) -> int:
+        return int(self._get("/blocks/tip/height"))
+
+    def getblockhash(self, height: int) -> str:
+        return str(self._get(f"/block-height/{int(height)}"))
+
+    def getblock(self, blockhash: str, verbosity: int = 2) -> dict:
+        raw = self._get(f"/block/{blockhash}/raw", expect_bytes=True)
+        return parse_raw_block(raw, blockhash=blockhash)
+
+
 def make_rpc(config):
+    if config.get("source") == "esplora":
+        return EsploraBlockClient(
+            config.get("esplora_urls") or config["explorer_url"],
+            request_delay=config.get("esplora_delay", 0.25),
+        )
     if AuthServiceProxy is None:
-        sys.exit("python-bitcoinrpc is required to run indexer.py")
+        sys.exit("python-bitcoinrpc is required when INDEXER_SOURCE=rpc")
     uri = (
         f"http://{config['rpc_user']}:{config['rpc_pass']}@"
         f"{config['rpc_host']}:{config['rpc_port']}"
@@ -211,6 +369,53 @@ def make_stored_filename(txid: str, filename_meta, mime) -> str:
     return f"{safe_txid}_{name_with_ext}"
 
 
+def _tx_maybe_bpub_reveal(tx_dict: dict) -> bool:
+    """
+    Fast pre-filter on getblock(..., 2) transaction JSON before deserializing.
+    A BPUB 1-of-N multisig P2WSH witness script is >= 70 bytes (>= 140 hex chars)
+    and begins with 0x51 0x21 (OP_1 PUSH33).
+    """
+    vins = tx_dict.get("vin")
+    if not isinstance(vins, list):
+        return True
+    saw_witness_field = False
+    for vin in vins:
+        wit = vin.get("txinwitness")
+        if not isinstance(wit, list):
+            continue
+        saw_witness_field = True
+        if len(wit) >= 2:
+            last = wit[-1]
+            if isinstance(last, str) and len(last) >= 140 and last[:4].lower() == "5121":
+                return True
+    # If RPC returned decoded vins (standard verbosity=2) and none matched, skip.
+    return not saw_witness_field and not any("coinbase" in v for v in vins if isinstance(v, dict))
+
+
+def _tx_maybe_bpub_owner(tx_dict: dict) -> bool:
+    """
+    Fast pre-filter on getblock(..., 2) transaction JSON for v5 ownership spends.
+    An owner P2WSH redeemScript is always exactly 59 bytes (118 hex chars):
+      20 <32B bpub_id> 75 76 a9 14 <20B h160> 88 ac
+    """
+    vins = tx_dict.get("vin")
+    if not isinstance(vins, list):
+        return True
+    for vin in vins:
+        wit = vin.get("txinwitness")
+        if not isinstance(wit, list) or len(wit) < 2:
+            continue
+        last = wit[-1]
+        if (
+            isinstance(last, str)
+            and len(last) == 118
+            and last[:2].lower() == "20"
+            and last[66:74].lower() == "7576a914"
+        ):
+            return True
+    return False
+
+
 def try_extract_bpub_from_tx(rawtx_hex: str):
     """
     Try to detect and extract a BPUB stream (v3.5 or v4/v5) from a transaction.
@@ -243,6 +448,9 @@ def try_extract_bpub_from_tx(rawtx_hex: str):
             continue
 
         redeem_script = bytes(wstack[-1])
+        # Fast byte check: OP_1 (0x51) + PUSH33 (0x21) and >= 70 bytes.
+        if len(redeem_script) < 70 or redeem_script[0] != 0x51 or redeem_script[1] != 0x21:
+            continue
         parsed = parse_bpub_multisig(redeem_script)
         if parsed is None:
             continue
@@ -306,6 +514,13 @@ def try_extract_owner_from_tx(rawtx_hex: str):
             continue
 
         redeem_script = bytes(wstack[-1])
+        # Fast byte check: 59-byte v5 owner redeemScript.
+        if (
+            len(redeem_script) != 59
+            or redeem_script[0] != 0x20
+            or redeem_script[33:37] != b"\x75\x76\xa9\x14"
+        ):
+            continue
         try:
             bpub_id_bytes, owner_h160 = decode_owner_redeem_script(redeem_script)
         except Exception:
@@ -482,20 +697,199 @@ def save_state(state_path: Path, next_height: int):
     tmp.replace(state_path)
 
 
+def index_block(db: BpubDB, media_dir: Path, block: dict, height: int) -> Tuple[int, int]:
+    """
+    Scan a single verbosity-2 block dict and persist all BPUB reveals,
+    verified v5 ownership updates, and the updated next_height atomically in
+    SQLite. Returns (reveals_indexed, owner_updates_applied).
+    """
+    blockhash = str(block.get("hash") or "")
+    block_time = block.get("time", None)
+    txs = block.get("tx", [])
+    media_dir.mkdir(parents=True, exist_ok=True)
+    media_dir_resolved = media_dir.resolve()
+
+    reveals_count = 0
+    owners_count = 0
+
+    with db.transaction() as conn:
+        # Pass 1: extract BPUB reveals and anchor v5 genesis ownership.
+        for tx in txs:
+            txid = tx.get("txid")
+            raw_hex = tx.get("hex")
+            if not txid or not raw_hex:
+                continue
+            if not _tx_maybe_bpub_reveal(tx):
+                continue
+            if db.has_item_tx(conn, txid):
+                continue
+
+            try:
+                res = try_extract_bpub_from_tx(raw_hex)
+                if not res:
+                    continue
+
+                meta, content = res
+                filename_meta = meta.get("filename")
+                mime = meta.get("mime") if isinstance(meta.get("mime"), str) else None
+                size = meta.get("size")
+                bpub_version = meta.get("bpub_version")
+
+                stored_name = make_stored_filename(txid, filename_meta, mime)
+                out_path = (media_dir / stored_name).resolve()
+                if out_path.parent != media_dir_resolved:
+                    sys.stderr.write(
+                        f"[WARN] Refusing unsafe output path for tx {txid}\n"
+                    )
+                    continue
+
+                if not out_path.exists():
+                    with open(out_path, "wb") as f:
+                        f.write(content)
+
+                bpub_id_val = meta.get("bpub_id")
+                bpub_id_hex = None
+                if bpub_id_val is not None:
+                    bpub_id_hex = (
+                        bpub_id_val.hex()
+                        if isinstance(bpub_id_val, (bytes, bytearray))
+                        else str(bpub_id_val)
+                    )
+
+                entry = {
+                    "txid": txid,
+                    "block_height": height,
+                    "block_hash": blockhash,
+                    "time": block_time,
+                    "filename": filename_meta if isinstance(filename_meta, str) else None,
+                    "stored_filename": stored_name,
+                    "mime": mime,
+                    "size": size,
+                    "bpub_version": bpub_version,
+                    "script_suffix": meta.get("script_suffix"),
+                    "bpub_id": bpub_id_hex,
+                    "funding_txids": meta.get("funding_txids", []),
+                }
+
+                if db.insert_item_tx(conn, entry):
+                    reveals_count += 1
+                if bpub_id_hex:
+                    db.register_genesis_tx(
+                        conn, bpub_id_hex, meta.get("funding_txids", [])
+                    )
+
+                sys.stderr.write(
+                    f"[FOUND] BPUB v{bpub_version} file in tx {txid}: "
+                    f"{stored_name} ({size} bytes, mime={mime})\n"
+                )
+            except Exception as e:
+                sys.stderr.write(
+                    f"[ERROR] Failed processing reveal tx {txid}: {e}\n"
+                )
+
+        # Pass 2: process verified v5 ownership transitions (runs after pass 1
+        # so same-block reveal + owner-reveal link cleanly).
+        for tx in txs:
+            txid = tx.get("txid")
+            raw_hex = tx.get("hex")
+            if not txid or not raw_hex:
+                continue
+            if not _tx_maybe_bpub_owner(tx):
+                continue
+            try:
+                owner_info = try_extract_owner_from_tx(raw_hex)
+                if owner_info and db.apply_owner_update_tx(
+                    conn, owner_info, txid, height, blockhash, block_time
+                ):
+                    owners_count += 1
+                    sys.stderr.write(
+                        f"[FOUND] BPUB v5 ownership update for "
+                        f"{owner_info['bpub_id']} in tx {txid}\n"
+                    )
+            except Exception as e:
+                sys.stderr.write(
+                    f"[ERROR] Failed processing owner tx {txid}: {e}\n"
+                )
+
+        db.record_block_tx(conn, height, blockhash)
+        db.set_state_tx(conn, "next_height", str(height + 1))
+        if blockhash:
+            db.set_state_tx(conn, "last_block_hash", blockhash)
+
+    return reveals_count, owners_count
+
+
+def reconcile_reorg(
+    rpc,
+    db: BpubDB,
+    media_dir: Path,
+    current_height: int,
+    min_height: int,
+) -> int:
+    """
+    Detect chain reorganizations by checking stored block hashes in
+    `indexed_blocks` against `rpc.getblockhash(h)`. Walks back to the common
+    ancestor, atomically rolls back orphaned items/ownership/blocks, and
+    returns the height to resume scanning from.
+    """
+    check_h = current_height - 1
+    if check_h < min_height:
+        return current_height
+
+    stored_hash = db.get_block_hash(check_h)
+    if not stored_hash:
+        return current_height
+
+    try:
+        chain_hash = rpc.getblockhash(check_h)
+    except Exception:
+        return current_height
+
+    if chain_hash == stored_hash:
+        return current_height
+
+    sys.stderr.write(
+        f"[WARN] Reorg detected at height {check_h}: "
+        f"indexed={stored_hash} chain={chain_hash}. Walking back...\n"
+    )
+    fork_h = check_h - 1
+    while fork_h >= min_height:
+        s_hash = db.get_block_hash(fork_h)
+        if not s_hash:
+            break
+        if rpc.getblockhash(fork_h) == s_hash:
+            break
+        fork_h -= 1
+
+    res = db.rollback_above(fork_h, media_dir=media_dir)
+    sys.stderr.write(
+        f"[WARN] Rolled back blocks above height {fork_h}: {res}. "
+        f"Resuming at height {fork_h + 1}.\n"
+    )
+    return fork_h + 1
+
+
 def main():
     config = load_config()
     rpc = make_rpc(config)
 
     gallery_dir: Path = config["gallery_dir"]
     gallery_dir.mkdir(parents=True, exist_ok=True)
+    media_dir = gallery_dir / "media"
+    media_dir.mkdir(parents=True, exist_ok=True)
 
-    manifest, known_txids, manifest_path, media_dir = load_manifest(gallery_dir)
-    ownership, ownership_path = load_ownership(gallery_dir)
-    current_height, state_path = load_state(gallery_dir, config["start_height"])
+    db_path = Path(os.getenv("BPUB_DB_PATH", str(gallery_dir / "bpub.db")))
+    db = BpubDB(db_path)
+    migrated = db.migrate_legacy_json(gallery_dir)
+    if any(migrated.values()):
+        sys.stderr.write(
+            f"[INFO] Migrated legacy JSON files into {db_path}: {migrated}\n"
+        )
 
+    current_height = db.get_next_height(config["start_height"])
     sys.stderr.write(
         f"[INFO] Starting BPUB indexer at height {current_height}, "
-        f"gallery={gallery_dir}\n"
+        f"db={db_path}, media={media_dir}\n"
     )
 
     poll_interval = config["poll_interval"]
@@ -506,6 +900,15 @@ def main():
         except Exception as e:
             sys.stderr.write(f"[ERROR] RPC getblockcount failed: {e}\n")
             time.sleep(poll_interval)
+            continue
+
+        try:
+            current_height = reconcile_reorg(
+                rpc, db, media_dir, current_height, config["start_height"]
+            )
+        except Exception as e:
+            sys.stderr.write(f"[ERROR] Reorg check failed: {e}\n")
+            time.sleep(5)
             continue
 
         while current_height <= best_height:
@@ -523,123 +926,9 @@ def main():
                 f"[INFO] Scanning block {current_height} ({blockhash}), "
                 f"{len(block.get('tx', []))} txs\n"
             )
-
-            block_time = block.get("time", None)
-            txs = block.get("tx", [])
-            manifest_dirty = False
-            ownership_dirty = False
-            media_dir_resolved = media_dir.resolve()
-
-            # Pass 1: extract BPUB reveals and anchor v5 genesis ownership.
-            for tx in txs:
-                txid = tx.get("txid")
-                raw_hex = tx.get("hex")
-                if not txid or not raw_hex or txid in known_txids:
-                    continue
-
-                try:
-                    res = try_extract_bpub_from_tx(raw_hex)
-                    if not res:
-                        continue
-
-                    meta, content = res
-                    filename_meta = meta.get("filename")
-                    mime = meta.get("mime") if isinstance(meta.get("mime"), str) else None
-                    size = meta.get("size")
-                    bpub_version = meta.get("bpub_version")
-
-                    stored_name = make_stored_filename(txid, filename_meta, mime)
-                    out_path = (media_dir / stored_name).resolve()
-                    if out_path.parent != media_dir_resolved:
-                        sys.stderr.write(
-                            f"[WARN] Refusing unsafe output path for tx {txid}\n"
-                        )
-                        continue
-
-                    if not out_path.exists():
-                        with open(out_path, "wb") as f:
-                            f.write(content)
-
-                    entry = {
-                        "txid": txid,
-                        "block_height": current_height,
-                        "block_hash": blockhash,
-                        "time": block_time,
-                        "filename": filename_meta if isinstance(filename_meta, str) else None,
-                        "stored_filename": stored_name,
-                        "mime": mime,
-                        "size": size,
-                        "bpub_version": bpub_version,
-                    }
-
-                    bpub_id_val = meta.get("bpub_id")
-                    bpub_id_hex = None
-                    if bpub_id_val is not None:
-                        bpub_id_hex = (
-                            bpub_id_val.hex()
-                            if isinstance(bpub_id_val, (bytes, bytearray))
-                            else str(bpub_id_val)
-                        )
-                        entry["bpub_id"] = bpub_id_hex
-                        if register_bpub_genesis(
-                            ownership, bpub_id_hex, meta.get("funding_txids", [])
-                        ):
-                            ownership_dirty = True
-
-                    manifest.append(entry)
-                    known_txids.add(txid)
-                    manifest_dirty = True
-                    sys.stderr.write(
-                        f"[FOUND] BPUB v{bpub_version} file in tx {txid}: "
-                        f"{stored_name} ({size} bytes, mime={mime})\n"
-                    )
-                except Exception as e:
-                    sys.stderr.write(
-                        f"[ERROR] Failed processing reveal tx {txid}: {e}\n"
-                    )
-
-            # Pass 2: process verified v5 ownership transitions (runs after
-            # pass 1 so same-block reveal + owner-reveal link properly).
-            for tx in txs:
-                txid = tx.get("txid")
-                raw_hex = tx.get("hex")
-                if not txid or not raw_hex:
-                    continue
-                try:
-                    owner_info = try_extract_owner_from_tx(raw_hex)
-                    if owner_info and apply_owner_update(
-                        ownership,
-                        owner_info,
-                        txid,
-                        current_height,
-                        blockhash,
-                        block_time,
-                    ):
-                        ownership_dirty = True
-                        sys.stderr.write(
-                            f"[FOUND] BPUB v5 ownership update for "
-                            f"{owner_info['bpub_id']} in tx {txid}\n"
-                        )
-                except Exception as e:
-                    sys.stderr.write(
-                        f"[ERROR] Failed processing owner tx {txid}: {e}\n"
-                    )
-
-            if manifest_dirty:
-                try:
-                    save_manifest(manifest, manifest_path)
-                except Exception as e:
-                    sys.stderr.write(f"[ERROR] Failed to save manifest.json: {e}\n")
-            if ownership_dirty:
-                try:
-                    save_ownership(ownership, ownership_path)
-                except Exception as e:
-                    sys.stderr.write(
-                        f"[ERROR] Failed to save ownership.json: {e}\n"
-                    )
-
+            block.setdefault("hash", blockhash)
+            index_block(db, media_dir, block, current_height)
             current_height += 1
-            save_state(state_path, current_height)
 
         time.sleep(poll_interval)
 

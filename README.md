@@ -91,6 +91,24 @@ $ python3 bpub.py signreveal \
 
 <broadcast transfer tx>
 
-# run indexer (scans for embedded data on-chain)
+# run indexer (scans for embedded data on-chain into SQLite `gallery/bpub.db`)
 $ python3 indexer.py
+
+# run gallery web server + padv3 embed API (defaults to 0.0.0.0:8888)
+$ uvicorn server:app --host 0.0.0.0 --port 8888
 ```
+
+## Gallery Website, SQLite Indexer & Custodial LND Inscriptions
+
+Copy `.env.sample` to `.env`, configure your Bitcoin/BLAKE2b Knots RPC credentials, and launch the full stack with Docker Compose:
+
+```bash
+cp .env.sample .env
+docker compose up -d --build
+```
+
+Services started by `docker-compose.yml`:
+- `web`: FastAPI gallery UI, `/media/*`, `padv3` PSBT studio, broadcaster (`mempool.kilombino.com`), and Lightning order API on `0.0.0.0:8888`. Point `cloudflared` at port `8888` with `BPUB_TRUST_PROXY=1` (reads `CF-Connecting-IP`).
+- `indexer`: Scans blocks from either `INDEXER_SOURCE=esplora` (default when RPC is unset — 1 `/api/block/{hash}/raw` request per block from `EXPLORER_BASE_URL`, supporting both 80-byte Bitcoin and 164-byte BLAKE2b headers) or local `bitcoind` RPC, stores reveals & verified v5 ownership into WAL-mode SQLite (`bpub.db`), auto-migrates legacy JSON files, and rolls back orphaned blocks on chain reorgs.
+- `order-worker`: Optional custodial Lightning (`LND_REST_URL` + least-privilege `invoice.macaroon`) fulfillment worker that creates `padv3` inscriptions on behalf of users using either a dedicated Esplora hot wallet (`ORDER_HOT_WIF`, no local Knots node needed) or a local Knots RPC wallet, signing with `SIGHASH_UNIFIED` (`ORDER_SIGN_MODE=unified`, or `btc` for standard Bitcoin). Leave `LND_REST_URL` empty to disable custodial orders cleanly.
+

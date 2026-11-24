@@ -1,6 +1,13 @@
 .env
 seed.txt
 gallery/manifest.json
+gallery/ownership.json
 gallery/media
 gallery/indexer_state.json
+gallery/bpub.db
+gallery/bpub.db-wal
+gallery/bpub.db-shm
+gallery/order_payloads
+__pycache__/
+*.pyc
 *.swp
